@@ -789,9 +789,10 @@ impl LoomView {
                 ..
             })) => {
                 self.event_stream_epoch = stream_epoch;
-                self.rebuild_projection_from_events(
+                self.rebuild_projection_from_events_after(
                     events,
                     Self::rebuild_cursor_floor(request_cursor, fallback_latest_sequence),
+                    fallback_latest_sequence,
                     fallback_run,
                 );
             }
@@ -803,9 +804,16 @@ impl LoomView {
                 ..
             })) => {
                 self.event_stream_epoch = stream_epoch;
+                let snapshot_state = session.state;
                 self.active_session = session;
                 self.session_state = self.active_session.state;
-                self.rebuild_projection_from_events(events, Some(latest_sequence), fallback_run);
+                self.apply_event_snapshot_with_durable(
+                    events,
+                    latest_sequence,
+                    fallback_latest_sequence,
+                    fallback_run,
+                    Some(snapshot_state),
+                );
             }
             Err(error) => {
                 self.rebuild_projection_from_events(Vec::new(), None, fallback_run);

@@ -776,6 +776,7 @@ impl LoomView {
             node_input_initial: String::new(),
             node_input_state: None,
             run_poll_scheduled: false,
+            replaying_events: false,
             browser_startup_error: None,
             browser_starting: false,
             browser_connection_lost: None,
@@ -1187,6 +1188,7 @@ impl LoomView {
             node_input_initial,
             node_input_state: None,
             run_poll_scheduled: false,
+            replaying_events: false,
             browser_workspace: options.workspace().map(str::to_owned),
             browser_model: options.model().cloned(),
             browser_window_initialized: true,
@@ -1431,6 +1433,7 @@ impl LoomView {
             node_input_initial: String::new(),
             node_input_state: None,
             run_poll_scheduled: false,
+            replaying_events: false,
             #[cfg(target_family = "wasm")]
             browser_workspace: None,
             #[cfg(target_family = "wasm")]
@@ -1822,6 +1825,7 @@ impl LoomView {
             node_input_initial: String::new(),
             node_input_state: None,
             run_poll_scheduled: false,
+            replaying_events: false,
             browser_workspace: options.workspace().map(str::to_owned),
             browser_model: options.model().cloned(),
             browser_window_initialized: false,

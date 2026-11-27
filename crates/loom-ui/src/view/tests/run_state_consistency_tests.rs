@@ -169,10 +169,18 @@ fn finished_after_tools_state_agrees_across_footer_pills_timer_composer_and_cont
         assert!(window.try_find(("project-activity", 0usize)).is_none());
         assert!(window.try_find(("project-status", 0usize)).is_none());
 
-        // Model footer shows the model used for the run, never "No model is configured".
-        let model_label = view.read(cx).model_picker_display_label(cx);
-        assert_eq!(model_label, "Anthropic · claude-sonnet-4");
-        assert_ne!(model_label, "No model is configured");
+        // Model footer shows the model used for the run on the rendered Select,
+        // never "No model is configured".
+        let model_select = window.find("session-model-select");
+        let model_label = model_select.label();
+        assert_eq!(
+            model_label,
+            Some("Model for this session: Anthropic · claude-sonnet-4")
+        );
+        assert_ne!(
+            model_label,
+            Some("Model for this session: No model is configured")
+        );
 
         view.read_with(cx, |view, _| {
             assert!(!view.run_can_pause());
@@ -243,8 +251,8 @@ fn genuinely_running_state_shows_active_status_timer_hint_and_controls(cx: &mut 
         );
         assert_eq!(window.find("run-card-status").label(), Some("Reviewing"));
         assert_eq!(
-            view.read(cx).model_picker_display_label(cx),
-            "OpenAI · gpt-5"
+            window.find("session-model-select").label(),
+            Some("Model for this session: OpenAI · gpt-5")
         );
 
         view.read_with(cx, |view, _| {
@@ -282,23 +290,45 @@ fn paused_state_freezes_timer_hides_pause_and_agrees_across_all_surfaces(cx: &mu
         view.review.open = true;
         view.review.tab = InspectorTab::Run;
 
-        let snapshot = run_snapshot_with_times(
-            view.active_session.id,
-            run_id,
-            anthropic_sonnet(),
-            AgentRunState::Evaluating,
-            started_at,
-            paused_at,
-            None,
-        );
-        view.adopt_active_run(snapshot);
+        let session_id = view.active_session.id;
+        let fallback = AgentRunSnapshotProjection {
+            run: run_snapshot_with_times(
+                session_id,
+                run_id,
+                anthropic_sonnet(),
+                AgentRunState::Evaluating,
+                started_at,
+                paused_at,
+                None,
+            ),
+            plan: Vec::new(),
+            plan_progress: Default::default(),
+            messages: Vec::new(),
+            message_timeline_ordinals: Vec::new(),
+            pending_approval: None,
+            pending_input: None,
+            usage: Default::default(),
+            activities: Vec::new(),
+        };
+        let events = vec![ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(2),
+            session_id,
+            event: ServerEvent::AgentSessionStateChanged {
+                previous: AgentSessionState::Evaluating,
+                current: AgentSessionState::Paused,
+            },
+        }];
 
-        // Even when the pause arrives as a session state event rather than a
-        // run event, run state and session state must stay in lockstep.
-        view.consume_event(&ServerEvent::AgentSessionStateChanged {
-            previous: AgentSessionState::Evaluating,
-            current: AgentSessionState::Paused,
-        });
+        // Replaying a historical pause that arrived as a session state event
+        // keeps run state and session state in lockstep and preserves the
+        // historical pause timestamp instead of climbing to wall-clock now.
+        view.rebuild_projection_from_events_after(
+            events,
+            Some(EventSequence::new(2)),
+            Some(EventSequence::new(1)),
+            Some(fallback),
+        );
         view
     });
 
@@ -328,10 +358,10 @@ fn paused_state_freezes_timer_hides_pause_and_agrees_across_all_surfaces(cx: &mu
         assert_eq!(window.find("run-card-status").label(), Some("Paused"));
         assert_eq!(window.find("run-card-elapsed").label(), Some("1m 43s"));
 
-        // Model footer shows the run's model, not "No model is configured".
+        // Model footer shows the run's model on the rendered Select, not "No model is configured".
         assert_eq!(
-            view.read(cx).model_picker_display_label(cx),
-            "Anthropic · claude-sonnet-4"
+            window.find("session-model-select").label(),
+            Some("Model for this session: Anthropic · claude-sonnet-4")
         );
 
         view.read_with(cx, |view, _| {
@@ -386,9 +416,10 @@ fn no_model_state_shows_no_model_configured_and_no_run_controls(cx: &mut TestApp
         );
         assert_eq!(window.find("run-card-status").label(), Some("Ready"));
         assert_eq!(
-            view.read(cx).model_picker_display_label(cx),
-            "No model is configured"
+            window.find("session-model-select").label(),
+            Some("Model for this session: No model is configured")
         );
+        let _ = view;
     })
     .unwrap();
 }
@@ -457,5 +488,617 @@ fn run_state_mutations_keep_project_snapshots_and_completed_runs_consistent(
             view.project_tree_snapshots[0].agents[0].state,
             AgentSessionState::Completed
         );
+    });
+}
+
+#[gpui_kit::test]
+fn live_continuation_after_settled_run_keeps_polling_and_shows_running(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let now_ms = Timestamp::now().as_unix_millis();
+    let started_at = Timestamp::from_unix_millis(now_ms.saturating_sub(60_000));
+    let completed_at = Timestamp::from_unix_millis(started_at.as_unix_millis() + 10_000);
+    let run_id = RunId::new();
+
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        let mut settled = run_snapshot_with_times(
+            view.active_session.id,
+            run_id,
+            anthropic_sonnet(),
+            AgentRunState::Completed,
+            started_at,
+            completed_at,
+            Some(completed_at),
+        );
+        settled.summary = Some("Previous turn complete".to_owned());
+        view.adopt_active_run(settled);
+        assert!(!view.run_is_active());
+        assert!(!view.run_should_poll());
+
+        // Event-driven continuation (child wake, collaborator message, retry)
+        // emits RunStateChanged without a new RunStarted snapshot.
+        view.consume_agent_event(&AgentEvent::RunStateChanged {
+            run_id,
+            state: AgentRunState::Executing,
+        });
+        view
+    });
+
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+
+        assert_eq!(window.find("run-status-label").label(), Some("Working"));
+        assert!(window.try_find("loom-mark").is_some());
+        assert_eq!(
+            window.find("run-status-interrupt-hint").label(),
+            Some("esc to interrupt")
+        );
+        assert!(window.try_find("pause-run").is_some());
+        assert!(window.try_find("interrupt-run").is_some());
+        assert!(window.try_find(("project-activity", 0usize)).is_some());
+
+        view.update(cx, |view, _| {
+            assert!(view.run_is_active());
+            assert!(view.run_should_poll());
+            assert_eq!(view.session_state, AgentSessionState::Executing);
+            assert_eq!(view.active_session.state, AgentSessionState::Executing);
+            let run = view.active_run.as_ref().expect("run remains attached");
+            assert!(run.completed_at.is_none());
+            assert!(run.summary.is_none());
+
+            // Clear run so no poll timer lingers past the test.
+            view.active_run_id = None;
+            view.active_run = None;
+            view.run_state = None;
+            view.session_state = AgentSessionState::Idle;
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn archived_idle_and_queued_states_are_not_overwritten_by_previous_run(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let now_ms = Timestamp::now().as_unix_millis();
+    let started_at = Timestamp::from_unix_millis(now_ms.saturating_sub(20_000));
+    let settled_at = Timestamp::from_unix_millis(started_at.as_unix_millis() + 5_000);
+
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        let completed = run_snapshot_with_times(
+            view.active_session.id,
+            RunId::new(),
+            anthropic_sonnet(),
+            AgentRunState::Completed,
+            started_at,
+            settled_at,
+            Some(settled_at),
+        );
+        view.adopt_active_run(completed);
+        view
+    });
+
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+
+        // 1. Queued session state is not overwritten by the previous Completed run.
+        view.update(cx, |view, _| {
+            view.consume_event(&ServerEvent::AgentSessionStateChanged {
+                previous: AgentSessionState::Completed,
+                current: AgentSessionState::Queued,
+            });
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Queued"));
+        assert!(window.try_find("pause-run").is_none());
+        assert!(window.try_find("interrupt-run").is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.session_state, AgentSessionState::Queued);
+            assert_eq!(view.active_session.state, AgentSessionState::Queued);
+            assert!(!view.run_should_poll());
+        });
+
+        // 2. Remote archive via workspace lifecycle feed clears a Paused run
+        // and does not get reverted on the next render frame.
+        view.update(cx, |view, cx| {
+            let paused = run_snapshot_with_times(
+                view.active_session.id,
+                RunId::new(),
+                anthropic_sonnet(),
+                AgentRunState::Paused,
+                started_at,
+                settled_at,
+                None,
+            );
+            view.adopt_active_run(paused);
+            let session_id = view.active_session.id;
+            let node_id = view.default_backend_node_id.clone();
+            view.apply_workspace_lifecycle_events(
+                &node_id,
+                vec![ServerEventEnvelope {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(9),
+                    session_id,
+                    event: ServerEvent::AgentSessionArchived { session_id },
+                }],
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("pause-run").is_none());
+        assert!(window.try_find("resume-run").is_none());
+        assert!(window.try_find("interrupt-run").is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.session_state, AgentSessionState::Archived);
+            assert_eq!(view.active_session.state, AgentSessionState::Archived);
+            assert_eq!(view.sessions[0].state, AgentSessionState::Archived);
+            assert!(!view.run_should_poll());
+        });
+
+        // 3. Restored Idle state stays Idle across renders.
+        view.update(cx, |view, _| {
+            let session_id = view.active_session.id;
+            view.consume_event(&ServerEvent::AgentSessionRestored { session_id });
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Ready"));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.session_state, AgentSessionState::Idle);
+            assert_eq!(view.active_session.state, AgentSessionState::Idle);
+            assert!(!view.run_should_poll());
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn pending_input_and_approval_clear_when_run_goes_active_again(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let now = Timestamp::now();
+    let run_id = RunId::new();
+
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.review.open = true;
+        view.review.tab = InspectorTab::Run;
+        let run = run_snapshot_with_times(
+            view.active_session.id,
+            run_id,
+            anthropic_sonnet(),
+            AgentRunState::NeedsInput,
+            now,
+            now,
+            None,
+        );
+        view.adopt_active_run(run);
+        view.pending_input = Some("Which target?".to_owned());
+        view
+    });
+
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        assert!(window.try_find("tab-attention").is_some());
+
+        // Collaborator answers and the run transitions back to Executing.
+        view.update(cx, |view, _| {
+            let attempt_id = view.active_run.as_ref().unwrap().attempt_id;
+            view.consume_agent_event(&AgentEvent::UserMessage {
+                run_id,
+                attempt_id,
+                control_revision: 3,
+                interaction_id: None,
+                text: "Use main".to_owned(),
+            });
+            view.consume_agent_event(&AgentEvent::RunStateChanged {
+                run_id,
+                state: AgentRunState::Executing,
+            });
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Working"));
+        assert!(window.try_find("tab-attention").is_none());
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_input.is_none());
+            assert!(!view.session_run_presentation().has_pending_input);
+        });
+
+        // A pending approval clears as soon as the run goes active again.
+        view.update(cx, |view, _| {
+            let attempt_id = view.active_run.as_ref().unwrap().attempt_id;
+            view.consume_agent_event(&AgentEvent::ToolApprovalRequired {
+                run_id,
+                attempt_id,
+                control_revision: 4,
+                interaction_id: loom_core::InteractionId::new(),
+                call: ToolCall {
+                    id: ToolCallId::new(),
+                    name: "run_command".to_owned(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                },
+            });
+            view.consume_agent_event(&AgentEvent::RunStateChanged {
+                run_id,
+                state: AgentRunState::AwaitingApproval,
+            });
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("tab-attention").is_some());
+
+        view.update(cx, |view, _| {
+            view.consume_agent_event(&AgentEvent::RunStateChanged {
+                run_id,
+                state: AgentRunState::Executing,
+            });
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("tab-attention").is_none());
+        view.update(cx, |view, _| {
+            assert!(view.pending_approval.is_none());
+            assert!(!view.session_run_presentation().has_pending_approval);
+
+            view.active_run_id = None;
+            view.active_run = None;
+            view.run_state = None;
+            view.session_state = AgentSessionState::Idle;
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn elapsed_timer_never_snaps_backwards_on_live_pause_or_block_and_clears_cross_run_usage(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let now_ms = Timestamp::now().as_unix_millis();
+    let started_at = Timestamp::from_unix_millis(now_ms.saturating_sub(30_000));
+    let run_id = RunId::new();
+
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        // At RunStarted, updated_at == started_at and step 1 recorded 5s usage.
+        let run = run_snapshot_with_times(
+            view.active_session.id,
+            run_id,
+            anthropic_sonnet(),
+            AgentRunState::Executing,
+            started_at,
+            started_at,
+            None,
+        );
+        view.adopt_active_run(run);
+        view.consume_agent_event(&AgentEvent::RunUsageUpdated {
+            run_id,
+            usage: UsageSnapshot {
+                elapsed_ms: 5_000,
+                ..UsageSnapshot::default()
+            },
+        });
+        view
+    });
+
+    view.update(cx, |view, _| {
+        // Live transition to Paused must freeze at the live elapsed duration
+        // (~30s), never snapping backwards to 0ms or step 1's 5s usage.
+        view.consume_agent_event(&AgentEvent::RunStateChanged {
+            run_id,
+            state: AgentRunState::Paused,
+        });
+        let paused_elapsed = view
+            .session_run_presentation()
+            .elapsed_ms
+            .expect("paused run has frozen elapsed time");
+        assert!(
+            paused_elapsed >= 25_000,
+            "live pause snapped backwards to {paused_elapsed}ms"
+        );
+
+        // Starting a brand-new run clears the previous run's usage so stale
+        // elapsed_ms cannot leak into the new run.
+        let next_run_id = RunId::new();
+        let next_started = Timestamp::now();
+        let next_run = run_snapshot_with_times(
+            view.active_session.id,
+            next_run_id,
+            anthropic_sonnet(),
+            AgentRunState::Planning,
+            next_started,
+            next_started,
+            None,
+        );
+        view.consume_agent_event(&AgentEvent::RunStarted { snapshot: next_run });
+        assert!(view.review.usage.run.is_none());
+
+        // Historical replay uses ActivityRecorded timestamps rather than
+        // wall-clock now(), so an old paused run freezes at its activity time.
+        let old_start = Timestamp::from_unix_millis(now_ms.saturating_sub(60 * 60 * 1_000));
+        let old_activity_end = Timestamp::from_unix_millis(old_start.as_unix_millis() + 42_000);
+        let old_run_id = RunId::new();
+        let fallback = AgentRunSnapshotProjection {
+            run: run_snapshot_with_times(
+                view.active_session.id,
+                old_run_id,
+                anthropic_sonnet(),
+                AgentRunState::Executing,
+                old_start,
+                old_start,
+                None,
+            ),
+            plan: Vec::new(),
+            plan_progress: Default::default(),
+            messages: Vec::new(),
+            message_timeline_ordinals: Vec::new(),
+            pending_approval: None,
+            pending_input: None,
+            usage: UsageSnapshot::default(),
+            activities: Vec::new(),
+        };
+        let activity = AgentActivityRecord {
+            id: loom_core::ActivityId::new(),
+            run_id: old_run_id,
+            timeline_ordinal: 1,
+            parent_id: None,
+            step_id: None,
+            kind: loom_protocol::AgentActivityKind::ModelTurn,
+            status: loom_protocol::AgentActivityStatus::Completed,
+            started_at: old_start,
+            completed_at: Some(old_activity_end),
+            elapsed_ms: Some(42_000),
+            data: loom_protocol::AgentActivityData::ModelTurn {
+                model: anthropic_sonnet(),
+            },
+        };
+        let events = vec![
+            ServerEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(2),
+                session_id: view.active_session.id,
+                event: ServerEvent::Agent {
+                    event: AgentEvent::ActivityRecorded {
+                        run_id: old_run_id,
+                        activity,
+                    },
+                },
+            },
+            ServerEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(3),
+                session_id: view.active_session.id,
+                event: ServerEvent::Agent {
+                    event: AgentEvent::RunStateChanged {
+                        run_id: old_run_id,
+                        state: AgentRunState::Paused,
+                    },
+                },
+            },
+        ];
+        view.rebuild_projection_from_events_after(
+            events,
+            Some(EventSequence::new(3)),
+            Some(EventSequence::new(1)),
+            Some(fallback),
+        );
+        assert_eq!(view.session_run_presentation().elapsed_ms, Some(42_000));
+
+        view.active_run_id = None;
+        view.active_run = None;
+        view.run_state = None;
+        view.session_state = AgentSessionState::Idle;
+    });
+}
+
+#[gpui_kit::test]
+fn waiting_for_children_preserves_resume_on_child_and_root_and_never_overrides_failed(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let now = Timestamp::now();
+    let root_id = AgentSessionId::new();
+
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let child_id = view.active_session.id;
+        let project_id = ProjectId::from_uuid(*root_id.as_uuid());
+        let mut root_session = view.active_session.clone();
+        root_session.id = root_id;
+        root_session.name = "Root project".to_owned();
+        view.sessions = vec![root_session, view.active_session.clone()];
+        view.project_snapshot = Some(ProjectSnapshot {
+            project_id,
+            root_session_id: root_id,
+            parent_project_id: None,
+            agents: vec![
+                ProjectAgentRecord {
+                    session_id: root_id,
+                    project_id,
+                    parent_session_id: None,
+                    depth: 1,
+                    state: AgentSessionState::Paused,
+                    task_summary: None,
+                    output_cursor: EventSequence::default(),
+                    updated_at: now,
+                },
+                ProjectAgentRecord {
+                    session_id: child_id,
+                    project_id,
+                    parent_session_id: Some(root_id),
+                    depth: 2,
+                    state: AgentSessionState::Paused,
+                    task_summary: None,
+                    output_cursor: EventSequence::default(),
+                    updated_at: now,
+                },
+            ],
+            tasks: Vec::new(),
+            worktrees: Vec::new(),
+        });
+        let child_run = run_snapshot_with_times(
+            child_id,
+            RunId::new(),
+            anthropic_sonnet(),
+            AgentRunState::Paused,
+            now,
+            now,
+            None,
+        );
+        view.adopt_active_run(child_run);
+        view
+    });
+
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        // 1. Paused delegated child session must say "Paused" and allow Resume.
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Paused"));
+        assert!(window.try_find("resume-run").is_some());
+        assert!(view.read(cx).run_can_resume());
+
+        // 2. Switch active session to the root while a child is still live:
+        //    Paused root says "Waiting for sub-agents" AND keeps Resume enabled.
+        view.update(cx, |view, _| {
+            view.active_session.id = root_id;
+            let root_run = run_snapshot_with_times(
+                root_id,
+                RunId::new(),
+                anthropic_sonnet(),
+                AgentRunState::Paused,
+                now,
+                now,
+                None,
+            );
+            view.adopt_active_run(root_run);
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("run-status-label").label(),
+            Some("Waiting for sub-agents")
+        );
+        assert!(window.try_find("resume-run").is_some());
+        assert!(view.read(cx).run_can_resume());
+
+        // 3. Failed root with live children must report the failure, never
+        //    "Waiting for sub-agents".
+        view.update(cx, |view, _| {
+            let mut failed_run = run_snapshot_with_times(
+                root_id,
+                RunId::new(),
+                anthropic_sonnet(),
+                AgentRunState::Failed,
+                now,
+                now,
+                Some(now),
+            );
+            failed_run.summary = Some(format!(
+                "{}provider timed out",
+                loom_model::AGENT_RUN_FAILURE_SUMMARY_PREFIX
+            ));
+            view.adopt_active_run(failed_run);
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("run-status-label").label(),
+            Some("Something went wrong")
+        );
+        assert!(window.try_find("run-failure-reason").is_some());
+        assert!(window.try_find("retry-run").is_some());
+
+        view.update(cx, |view, _| {
+            view.active_run_id = None;
+            view.active_run = None;
+            view.run_state = None;
+            view.session_state = AgentSessionState::Idle;
+            view.project_snapshot = None;
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn snapshot_tail_skips_covered_events_and_mid_run_model_switch_survives_refresh(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let now = Timestamp::now();
+    let run_id = RunId::new();
+    let switched_model = ModelId::for_provider(
+        &loom_model::ProviderId::new("openai"),
+        &ModelId::new("gpt-5"),
+    );
+
+    let view = cx.new(|cx| LoomView::new_for_test(cx.focus_handle()));
+    view.update(cx, |view, _| {
+        let session_id = view.active_session.id;
+        let fallback = AgentRunSnapshotProjection {
+            run: run_snapshot_with_times(
+                session_id,
+                run_id,
+                anthropic_sonnet(),
+                AgentRunState::Evaluating,
+                now,
+                now,
+                None,
+            ),
+            plan: Vec::new(),
+            plan_progress: Default::default(),
+            messages: vec![
+                loom_model::ModelMessage::new(loom_model::MessageRole::User, "check it"),
+                loom_model::ModelMessage::new(loom_model::MessageRole::Assistant, "working on it"),
+            ],
+            message_timeline_ordinals: vec![0, 1],
+            pending_approval: None,
+            pending_input: None,
+            usage: UsageSnapshot::default(),
+            activities: Vec::new(),
+        };
+        // Tail window contains an already-covered UserMessage at seq 5 (<= durable 5)
+        // and no newer run events, while the snapshot reports a newer session state
+        // (Paused) at latest_sequence 8 (> durable 5).
+        let covered_event = ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(5),
+            session_id,
+            event: ServerEvent::Agent {
+                event: AgentEvent::UserMessage {
+                    run_id,
+                    attempt_id: fallback.run.attempt_id,
+                    control_revision: 2,
+                    interaction_id: None,
+                    text: "check it".to_owned(),
+                },
+            },
+        };
+        view.apply_event_snapshot_with_durable(
+            vec![covered_event],
+            EventSequence::new(8),
+            Some(EventSequence::new(5)),
+            Some(fallback),
+            Some(AgentSessionState::Paused),
+        );
+        // Covered UserMessage was not duplicated; newer snapshot session state won.
+        let user_rows = view
+            .timeline
+            .iter()
+            .filter(|item| matches!(item, TimelineItem::User(_)))
+            .count();
+        assert_eq!(user_rows, 1);
+        assert_eq!(view.run_state, Some(AgentRunState::Paused));
+        assert_eq!(view.session_state, AgentSessionState::Paused);
+
+        // Mid-run model switch queued in self.model must not revert to
+        // active_run.model when self.models is cleared during refresh.
+        view.model = switched_model.clone();
+        view.models.clear();
+        assert_eq!(view.model_picker_placeholder(), "OpenAI · gpt-5");
+
+        view.active_run_id = None;
+        view.active_run = None;
+        view.run_state = None;
+        view.session_state = AgentSessionState::Idle;
     });
 }

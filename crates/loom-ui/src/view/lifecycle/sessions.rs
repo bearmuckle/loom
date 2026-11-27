@@ -21,9 +21,17 @@ impl LoomView {
             .sessions
             .iter()
             .find(|session| session.id == self.active_session.id)
+            .cloned()
         {
-            self.active_session = active.clone();
-            self.session_state = active.state;
+            let preserved_state = self.effective_run_state().map(session_state_for_run);
+            self.active_session = active;
+            if let Some(state) = preserved_state {
+                self.active_session.state = state;
+                self.session_state = state;
+                self.update_session_list();
+            } else {
+                self.sync_session_state(self.active_session.state);
+            }
         }
 
         Ok(())
@@ -185,6 +193,8 @@ impl LoomView {
         // viewed, so the Changes marker and its recorded snapshot both go.
         self.review.reset_changes_unread();
         self.review.clear_unread(InspectorTab::Run);
+        self.review.usage.run = None;
+        self.review.usage.run_provider = None;
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.transcript_before_ordinal = None;
         self.transcript_loaded_ordinals.clear();
