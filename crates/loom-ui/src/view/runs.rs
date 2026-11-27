@@ -40,21 +40,24 @@ impl LoomView {
 
     /// The canonical run state for the active session.
     ///
-    /// A matching run snapshot's terminal state or completion timestamp wins
-    /// over a stale non-terminal `run_state`. When neither a matching run nor
-    /// `run_state` is set, a non-idle `session_state` supplies the matching run
-    /// state so the footer and sidebar pills stay in agreement.
+    /// Archived sessions have no active run state. When `run_state` has been
+    /// cleared for `Idle` or `Queued` transitions, a prior settled run does not
+    /// override the session state. Otherwise the live `run_state` (or the
+    /// matching run snapshot's state) is authoritative, falling back to a
+    /// non-idle `session_state` before a run snapshot loads.
     pub(crate) fn effective_run_state(&self) -> Option<AgentRunState> {
+        if self.session_state == AgentSessionState::Archived {
+            return None;
+        }
+        if self.run_state.is_none() && self.session_state == AgentSessionState::Queued {
+            return None;
+        }
         if let Some(run) = self.matched_active_run() {
-            if run_state_is_terminal(run.state) {
-                return Some(run.state);
-            }
-            if run.completed_at.is_some()
-                && self
-                    .run_state
-                    .is_none_or(|state| !run_state_is_terminal(state))
+            if self.run_state.is_none()
+                && self.session_state == AgentSessionState::Idle
+                && run_state_is_terminal(run.state)
             {
-                return Some(AgentRunState::Completed);
+                return None;
             }
             return self.run_state.or(Some(run.state));
         }
@@ -71,13 +74,25 @@ impl LoomView {
             .map(session_state_for_run)
             .unwrap_or(self.session_state);
         let is_active = run_state.is_some_and(run_state_is_active);
-        let is_terminal = run_state.is_some_and(run_state_is_terminal);
-        let has_pending_input = self.pending_input.is_some() && !is_terminal;
-        let has_pending_approval = self.pending_approval.is_some() && !is_terminal;
-        let show_mark = is_active || self.sending_message || has_pending_input;
-        let waiting_for_children = self.project_has_live_children() && !is_active;
+        let has_pending_input = self.pending_input.is_some()
+            && matches!(
+                run_state,
+                None | Some(AgentRunState::NeedsInput | AgentRunState::Paused)
+            );
+        let has_pending_approval = self.pending_approval.is_some()
+            && matches!(
+                run_state,
+                None | Some(AgentRunState::AwaitingApproval | AgentRunState::Paused)
+            );
+        let show_mark = is_active
+            || self.sending_message
+            || (has_pending_input && run_state != Some(AgentRunState::Paused));
+        let waiting_for_children =
+            self.project_root_is_active() && self.project_has_live_children() && !is_active;
         let (status_label, status_color) = if let Some(state) = run_state {
-            let label = if waiting_for_children {
+            let label = if waiting_for_children
+                && matches!(state, AgentRunState::Paused | AgentRunState::Completed)
+            {
                 "Waiting for sub-agents"
             } else {
                 run_state_label(Some(state))
@@ -87,10 +102,13 @@ impl LoomView {
             ("Sending", rgb(0x93c5fd))
         } else if has_pending_input {
             ("Waiting for your answer", rgb(0xfbbf24))
+        } else if session_state == AgentSessionState::Queued {
+            ("Queued", rgb(0x94a3b8))
         } else {
             ("Ready", rgb(0x64748b))
         };
-        let has_controllable_run = self.active_run_id.is_some()
+        let has_controllable_run = self.session_state != AgentSessionState::Archived
+            && self.active_run_id.is_some()
             && self
                 .active_run
                 .as_ref()
@@ -98,12 +116,10 @@ impl LoomView {
         let can_stop =
             has_controllable_run && run_state.is_some_and(|state| !run_state_is_terminal(state));
         let can_pause = can_stop && run_state != Some(AgentRunState::Paused);
-        let can_resume = has_controllable_run
-            && run_state == Some(AgentRunState::Paused)
-            && !waiting_for_children;
+        let can_resume = has_controllable_run && run_state == Some(AgentRunState::Paused);
         let can_retry = has_controllable_run && run_state == Some(AgentRunState::Failed);
         let show_interrupt_hint = is_active && can_stop;
-        let elapsed_ms = self.run_elapsed_ms_for(is_active);
+        let elapsed_ms = self.run_elapsed_ms_for(run_state, is_active);
         let run_model = self
             .matched_active_run()
             .map(|run| run.model.clone())
@@ -131,9 +147,16 @@ impl LoomView {
     /// Computes run elapsed time in milliseconds.
     ///
     /// Active runs tick against the current clock; paused, waiting, and
-    /// finished runs freeze at their completion or last-update timestamp so the
-    /// footer and inspector never show a live climbing timer after work stops.
-    fn run_elapsed_ms_for(&self, is_active: bool) -> Option<u64> {
+    /// finished runs freeze at their completion or latest update/usage
+    /// timestamp so the footer and inspector never snap backwards or climb
+    /// while stopped.
+    fn run_elapsed_ms_for(&self, run_state: Option<AgentRunState>, is_active: bool) -> Option<u64> {
+        let usage_elapsed = self
+            .review
+            .usage
+            .run
+            .as_ref()
+            .map_or(0, |usage| usage.elapsed_ms);
         if let Some(run) = self.matched_active_run() {
             if let Some(completed_at) = run.completed_at {
                 return Some(
@@ -143,16 +166,11 @@ impl LoomView {
                 );
             }
             if !is_active {
-                if let Some(usage) = self.review.usage.run.as_ref()
-                    && usage.elapsed_ms > 0
-                {
-                    return Some(usage.elapsed_ms);
-                }
-                return Some(
-                    run.updated_at
-                        .as_unix_millis()
-                        .saturating_sub(run.started_at.as_unix_millis()),
-                );
+                let span = run
+                    .updated_at
+                    .as_unix_millis()
+                    .saturating_sub(run.started_at.as_unix_millis());
+                return Some(span.max(usage_elapsed));
             }
             return Some(
                 Timestamp::now()
@@ -160,10 +178,8 @@ impl LoomView {
                     .saturating_sub(run.started_at.as_unix_millis()),
             );
         }
-        if let Some(usage) = self.review.usage.run.as_ref()
-            && usage.elapsed_ms > 0
-        {
-            return Some(usage.elapsed_ms);
+        if run_state.is_some() && usage_elapsed > 0 {
+            return Some(usage_elapsed);
         }
         None
     }
@@ -171,7 +187,13 @@ impl LoomView {
     /// Adopts an authoritative run snapshot and keeps `active_run_id`,
     /// `run_state`, `session_state`, `active_session.state`, sidebar rows,
     /// project snapshots, and the session's model in sync.
-    pub(crate) fn adopt_active_run(&mut self, run: AgentRunSnapshot) {
+    pub(crate) fn adopt_active_run(&mut self, mut run: AgentRunSnapshot) {
+        // Normalize a snapshot that carries a completion timestamp alongside a
+        // stale non-terminal state once on adoption; live continuations clear
+        // `completed_at` via `set_run_state` / `sync_session_state`.
+        if !run_state_is_terminal(run.state) && run.completed_at.is_some() {
+            run.state = AgentRunState::Completed;
+        }
         let state = run.state;
         self.active_run_id = Some(run.id);
         if !run.model.as_str().trim().is_empty() {

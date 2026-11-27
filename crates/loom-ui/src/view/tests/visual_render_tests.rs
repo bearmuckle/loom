@@ -442,11 +442,20 @@ fn run_states_render_distinct_consistent_frames() {
         view.default_model = ModelId::new("default");
     });
 
+    let configured_idle_model = capture(|view| {
+        view.sessions = vec![view.active_session.clone()];
+        view.models = vec![run_model.clone()];
+        view.default_models = vec![run_model.clone()];
+        view.model = run_model.clone();
+        view.default_model = run_model.clone();
+    });
+
     for (name, frame) in [
         ("finished_after_tools", &finished_after_tools),
         ("running", &running),
         ("paused", &paused),
         ("no_model", &no_model),
+        ("configured_idle_model", &configured_idle_model),
     ] {
         assert!(
             frame.has_aspect_ratio(1280, 800),
@@ -463,4 +472,9 @@ fn run_states_render_distinct_consistent_frames() {
     assert_ne!(finished_after_tools.fingerprint(), no_model.fingerprint());
     assert_ne!(running.fingerprint(), paused.fingerprint());
     assert_ne!(paused.fingerprint(), no_model.fingerprint());
+    assert_ne!(
+        configured_idle_model.fingerprint(),
+        no_model.fingerprint(),
+        "an idle session with a configured model should differ visually from the no-model state"
+    );
 }

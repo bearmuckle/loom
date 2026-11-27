@@ -839,6 +839,7 @@ pub(crate) struct LoomView {
     node_input_initial: String,
     node_input_state: Option<Entity<InputState>>,
     pub(crate) run_poll_scheduled: bool,
+    pub(crate) replaying_events: bool,
     #[cfg(target_family = "wasm")]
     browser_workspace: Option<String>,
     #[cfg(target_family = "wasm")]
@@ -2280,6 +2281,7 @@ impl LoomView {
             node_input_initial: String::new(),
             node_input_state: None,
             run_poll_scheduled: false,
+            replaying_events: false,
             browser_startup_error: None,
             browser_starting: false,
             browser_connection_lost: None,
