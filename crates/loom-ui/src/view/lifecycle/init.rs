@@ -657,6 +657,7 @@ impl LoomView {
             sending_message: false,
             status_banner: None,
             reconnecting: None,
+            offline_queue: Default::default(),
             connectivity_attempt_in_flight: false,
             status_details_open: false,
             model,
@@ -1053,6 +1054,7 @@ impl LoomView {
             sending_message: false,
             status_banner: None,
             reconnecting: None,
+            offline_queue: Default::default(),
             connectivity_attempt_in_flight: false,
             status_details_open: false,
             model: if demo_mode {
@@ -1308,6 +1310,7 @@ impl LoomView {
             sending_message: false,
             status_banner: None,
             reconnecting: None,
+            offline_queue: Default::default(),
             connectivity_attempt_in_flight: false,
             status_details_open: false,
             model: model.clone(),
@@ -1700,6 +1703,7 @@ impl LoomView {
             sending_message: false,
             status_banner: None,
             reconnecting: None,
+            offline_queue: Default::default(),
             connectivity_attempt_in_flight: false,
             status_details_open: false,
             model,
@@ -2579,12 +2583,25 @@ impl LoomView {
             let result = LoomView::try_new_browser(&options, focus_handle).await;
             view.update(cx, |view, cx| match result {
                 Ok(mut initialized) => {
-                    let active_session = initialized.active_session.clone();
+                    // A reconnect returns to the session that was open, when
+                    // the worker still has it, rather than the landing one.
+                    let active_session = initialized
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == view.active_session.id)
+                        .cloned()
+                        .unwrap_or_else(|| initialized.active_session.clone());
                     initialized.covering_surface = None;
                     initialized.browser_window_initialized = false;
-                    // The reconnect holds the startup screen until the landing
-                    // project is on screen, exactly like the first connect.
-                    initialized.browser_starting = !initialized.sessions.is_empty();
+                    // A workspace that stayed on screen through the outage is
+                    // reloaded in place; only a client with nothing on screen
+                    // holds the startup screen, like the first connect.
+                    let had_workspace = !view.sessions.is_empty();
+                    initialized.browser_starting =
+                        !had_workspace && !initialized.sessions.is_empty();
+                    // Prompts queued while offline survive the rebuild and go
+                    // out once the reloaded session can take them.
+                    initialized.offline_queue = std::mem::take(&mut view.offline_queue);
                     *view = initialized;
                     if !view.sessions.is_empty() {
                         view.open_browser_landing_session(active_session, cx);

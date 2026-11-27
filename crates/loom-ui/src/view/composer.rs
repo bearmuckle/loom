@@ -22,6 +22,14 @@ impl LoomView {
             self.run_slash_command(&text, cx);
             return;
         }
+        if self.is_offline() {
+            if !self.queue_offline_prompt(text) {
+                // The queue is full, so the draft stays for a later send.
+                self.clear_composer_on_render = false;
+            }
+            cx.notify();
+            return;
+        }
         if !self.send_composer_text(text.clone(), cx) {
             // Nothing was sent, so the draft stays in the composer.
             self.clear_composer_on_render = false;

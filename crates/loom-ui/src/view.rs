@@ -623,6 +623,8 @@ pub(crate) struct LoomView {
     /// unreachable, so repeated connectivity failures update one state instead
     /// of replacing the banner with a series of coded errors.
     reconnecting: Option<Reconnecting>,
+    /// Prompts sent while the worker was unreachable, sent once it answers.
+    offline_queue: offline::OfflineQueue,
     /// Whether an automatic reconnect attempt is already waiting on its timer,
     /// so the scheduler never stacks two attempts.
     connectivity_attempt_in_flight: bool,
@@ -2151,6 +2153,7 @@ impl LoomView {
             sending_message: false,
             status_banner: None,
             reconnecting: None,
+            offline_queue: offline::OfflineQueue::default(),
             connectivity_attempt_in_flight: false,
             status_details_open: false,
             model: model.clone(),
@@ -2396,6 +2399,7 @@ mod connectivity;
 mod helpers;
 mod lifecycle;
 mod mark;
+mod offline;
 mod project;
 mod providers;
 mod render;

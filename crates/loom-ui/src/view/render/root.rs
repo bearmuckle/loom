@@ -186,7 +186,11 @@ impl Render for LoomView {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
         #[cfg(target_family = "wasm")]
-        if !self.connected || self.browser_starting {
+        if crate::view::offline::browser_shows_connection_card(
+            self.browser_starting,
+            self.connected,
+            !self.sessions.is_empty(),
+        ) {
             return self.render_startup_screen(window, cx);
         }
         if self.rename_dialog.is_some() && self.rename_input_state.is_none() {

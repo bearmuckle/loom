@@ -233,13 +233,15 @@ impl LoomView {
     /// than silent.
     pub(crate) fn note_worker_answered(&mut self, cx: &mut Context<Self>) {
         self.connectivity_attempt_in_flight = false;
-        if self.reconnecting.take().is_none() {
-            return;
+        if self.reconnecting.take().is_some() {
+            self.browser_connection_lost = None;
+            log::info!("[loom-ui] worker connection restored");
+            self.record_status("Worker connection restored");
+            cx.notify();
         }
-        self.browser_connection_lost = None;
-        log::info!("[loom-ui] worker connection restored");
-        self.record_status("Worker connection restored");
-        cx.notify();
+        // Any answer may be the one that makes a queued prompt sendable: the
+        // reconnect itself, the reloaded models, or the previous send's reply.
+        self.flush_offline_queue(cx);
     }
 
     /// Forgets the reconnecting state, which stops the automatic attempts.

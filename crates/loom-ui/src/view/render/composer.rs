@@ -123,6 +123,36 @@ impl LoomView {
                         ),
                 )
             })
+            .when_some(self.offline_strip(), |element, text| {
+                let queued = self.offline_queue.count_for(self.active_session.id) > 0;
+                element.child(
+                    div()
+                        .id("offline-strip")
+                        .test_support()
+                        .w_full()
+                        .mb_2()
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x493b1a))
+                        .text_color(rgb(0xfef3c7))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().min_w(px(0.)).text_xs().child(text))
+                        .when(queued, |strip| {
+                            strip.child(
+                                Button::new("discard-offline-prompts")
+                                    .label("Discard queued")
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_offline_prompts(cx);
+                                    })),
+                            )
+                        }),
+                )
+            })
             .child(self.render_run_status())
             .when_some(self.composer_completion.clone(), |element, completion| {
                 element.child(
