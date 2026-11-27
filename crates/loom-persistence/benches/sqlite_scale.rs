@@ -286,6 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         created_at: now,
                         updated_at: now,
                         title_source: loom_core::SessionTitleSource::Auto,
+                        backend: None,
                     };
                     Ok(ServerEventEnvelope {
                         protocol_version: CURRENT_PROTOCOL_VERSION,

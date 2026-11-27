@@ -637,6 +637,10 @@ impl InProcessConnection {
             ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: requested_workspace,
                 ..
+            })
+            | ClientRequest::Workspace(WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
+                workspace_id: requested_workspace,
+                ..
             }) => {
                 if auth.scope().sessions.is_some() {
                     return Err(LoomError::new(
@@ -1014,7 +1018,8 @@ impl InProcessConnection {
             | ClientRequest::Provider(ProviderRequest::GetGitHubWriteAccess)
             | ClientRequest::Provider(ProviderRequest::GetGitHubRepositoryAccess)
             | ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { .. })
-            | ClientRequest::Provider(ProviderRequest::GetProviderHealth { .. }) => {}
+            | ClientRequest::Provider(ProviderRequest::GetProviderHealth { .. })
+            | ClientRequest::Provider(ProviderRequest::ProbeAcpHarness { .. }) => {}
             ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
             | ClientRequest::Provider(ProviderRequest::RemoveApiKeyProvider { .. })

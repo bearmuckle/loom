@@ -75,6 +75,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sysinfo::System;
 
+mod acp_host;
 mod activity_detail;
 mod auth;
 mod backend;
@@ -295,7 +296,8 @@ struct PersistedSessionFilesystem {
 struct RunHandle {
     run_id: loom_core::RunId,
     session_id: AgentSessionId,
-    runtime: Mutex<AgentRuntime>,
+    is_acp: bool,
+    runtime: Mutex<Option<AgentRuntime>>,
     control: RunControl,
     state: Mutex<AgentRuntimeState>,
     message_fragments: Mutex<MessageFragmentState>,
@@ -428,6 +430,7 @@ pub struct InProcessBackend {
     provider_credentials: Arc<ProviderCredentialService>,
     persistence: Option<Arc<dyn Persistence>>,
     run_executor: RunExecutor,
+    acp_sessions: acp_host::AcpSessionManager,
     session_root_base: PathBuf,
     /// Per-instance root for session build output. Present for a durable
     /// backend, absent for the in-memory one.

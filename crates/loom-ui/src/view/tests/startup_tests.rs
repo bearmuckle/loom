@@ -111,6 +111,7 @@ fn session(id: AgentSessionId, name: &str, updated_at: u64) -> AgentSessionSnaps
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(updated_at),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     }
 }
 

@@ -414,6 +414,7 @@ fn session(id: AgentSessionId, name: &str) -> AgentSessionSnapshot {
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     }
 }
 
@@ -757,7 +758,7 @@ fn session_snapshot_request_targets_its_session() {
         session_id_for_request(
             &ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot {
                 activity_detail: loom_protocol::ActivityDetail::Full,
-                session_id
+                session_id,
             }),
             AgentSessionId::new()
         ),

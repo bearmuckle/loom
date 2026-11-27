@@ -247,6 +247,7 @@ impl InProcessConnection {
                     );
                 })?;
         self.backend.journal()?.append_session(record);
+        self.backend.acp_sessions.close_session(session_id);
         self.backend.remove_build_cache(session_id);
         // Record the archived subtree so a root restore can tell a swept
         // descendant from one that was never archived with it.

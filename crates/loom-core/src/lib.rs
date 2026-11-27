@@ -90,8 +90,12 @@ pub use project::{
     TaskContextReference, normalize_project_child_scope_path,
 };
 pub use session::{
-    AgentSessionSnapshot, AgentSessionState, MAX_AGENT_SESSION_GOAL_BYTES, SessionEvent,
-    SessionEventRecord, SessionManagerState, normalize_session_goal,
+    ANTIGRAVITY_AUTH_GEMINI_API_KEY, ANTIGRAVITY_AUTH_OAUTH_PERSONAL, ANTIGRAVITY_HARNESS_ID,
+    ANTIGRAVITY_INTERACTIONS_NOTICE, ANTIGRAVITY_TERMS_RISK_NOTICE,
+    ANTIGRAVITY_UNREGISTERED_CLIENT_NOTICE, AcpCapabilities, AcpModelCatalogEntry,
+    AcpSessionBackend, AgentSessionSnapshot, AgentSessionState, MAX_AGENT_SESSION_GOAL_BYTES,
+    SessionBackendDescriptor, SessionEvent, SessionEventRecord, SessionManagerState,
+    normalize_session_goal,
 };
 pub use time::Timestamp;
 pub use title::{

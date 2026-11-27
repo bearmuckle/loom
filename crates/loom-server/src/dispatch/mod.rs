@@ -56,6 +56,9 @@ impl InProcessConnection {
             }
             ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace {
                 ..
+            })
+            | ClientRequest::Workspace(WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
+                ..
             }) => self.workspace_dispatch(request, request_id),
             ClientRequest::Workspace(WorkspaceRequest::GetWorkspaceConfigForWorkspace {
                 ..
@@ -339,7 +342,8 @@ impl InProcessConnection {
             ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { .. }) => {
                 self.provider_dispatch(request, request_id)
             }
-            ClientRequest::Provider(ProviderRequest::GetProviderHealth { .. }) => {
+            ClientRequest::Provider(ProviderRequest::GetProviderHealth { .. })
+            | ClientRequest::Provider(ProviderRequest::ProbeAcpHarness { .. }) => {
                 self.provider_dispatch(request, request_id)
             }
             ClientRequest::Usage(UsageRequest::GetRunUsage { .. }) => {

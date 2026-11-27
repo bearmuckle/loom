@@ -192,17 +192,20 @@ impl InProcessBackend {
                 });
                 loop {
                     let delivered = if let Some(persistence) = backend.persistence.as_ref() {
-                        let mut runtime = task_handle
+                        let mut runtime_guard = task_handle
                             .runtime
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
+                        let runtime = runtime_guard
+                            .as_mut()
+                            .expect("native run worker has runtime");
                         // This is the run's safe model-turn boundary: the inbox,
                         // queued directions, and owed child-finish notices are
                         // appended here and nowhere else, so no turn can land
                         // between an assistant tool call and its result.
-                        let project = deliver_project_agent_messages(persistence, &mut runtime);
-                        let directions = deliver_queued_run_directions(persistence, &mut runtime);
-                        let notices = deliver_project_child_notices(persistence, &mut runtime);
+                        let project = deliver_project_agent_messages(persistence, runtime);
+                        let directions = deliver_queued_run_directions(persistence, runtime);
+                        let notices = deliver_project_child_notices(persistence, runtime);
                         let mut delivered = false;
                         for result in [project, directions, notices] {
                             match result {
@@ -215,7 +218,7 @@ impl InProcessBackend {
                             }
                         }
                         if delivered {
-                            task_handle.refresh(&runtime);
+                            task_handle.refresh(runtime);
                         }
                         delivered
                     } else {
@@ -237,10 +240,13 @@ impl InProcessBackend {
                     if let Some(provider) = task_handle.take_provider_replacement() {
                         let current_model = task_handle.snapshot().model;
                         if provider.descriptor().id == current_model {
-                            let mut runtime = task_handle
+                            let mut runtime_guard = task_handle
                                 .runtime
                                 .lock()
                                 .unwrap_or_else(PoisonError::into_inner);
+                            let runtime = runtime_guard
+                                .as_mut()
+                                .expect("native run worker has runtime");
                             if let Err(error) = runtime.replace_provider(provider) {
                                 task_handle.record_failure(error);
                                 break;
@@ -269,17 +275,20 @@ impl InProcessBackend {
                             output_cost_micros_per_1k,
                         } = switch;
                         let applied = (|| -> Result<bool> {
-                            let mut runtime = task_handle
+                            let mut runtime_guard = task_handle
                                 .runtime
                                 .lock()
                                 .unwrap_or_else(PoisonError::into_inner);
+                            let runtime = runtime_guard
+                                .as_mut()
+                                .expect("native run worker has runtime");
                             let changed = runtime.set_model(
                                 model.clone(),
                                 provider,
                                 input_cost_micros_per_1k,
                                 output_cost_micros_per_1k,
                             )?;
-                            task_handle.refresh(&runtime);
+                            task_handle.refresh(runtime);
                             Ok(changed)
                         })();
                         match applied {
@@ -309,10 +318,13 @@ impl InProcessBackend {
                         }
                     }
                     let progress = {
-                        let mut runtime = task_handle
+                        let mut runtime_guard = task_handle
                             .runtime
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
+                        let runtime = runtime_guard
+                            .as_mut()
+                            .expect("native run worker has runtime");
                         // Re-read the GitHub credentials, write grant, and
                         // repository-access fact each step so settings toggled
                         // while a run is registered (for example while it waits
@@ -332,7 +344,7 @@ impl InProcessBackend {
                             runtime.set_goal(session.goal.clone());
                         }
                         let progress = runtime.run_step();
-                        task_handle.refresh(&runtime);
+                        task_handle.refresh(runtime);
                         progress
                     };
                     if task_handle.failure().is_some() {
@@ -377,14 +389,17 @@ impl InProcessBackend {
                                 let delivered = if let Some(persistence) =
                                     backend.persistence.as_ref()
                                 {
-                                    let mut runtime = task_handle
+                                    let mut runtime_guard = task_handle
                                         .runtime
                                         .lock()
                                         .unwrap_or_else(PoisonError::into_inner);
-                                    match deliver_queued_run_directions(persistence, &mut runtime) {
+                                    let runtime = runtime_guard
+                                        .as_mut()
+                                        .expect("native run worker has runtime");
+                                    match deliver_queued_run_directions(persistence, runtime) {
                                         Ok(delivered) => {
                                             if delivered {
-                                                task_handle.refresh(&runtime);
+                                                task_handle.refresh(runtime);
                                             }
                                             delivered
                                         }

@@ -2,10 +2,12 @@
 //!
 //! A harness is an external agent that owns its conversation, its tool
 //! execution and its context. [`claude_code`] drives the Claude Code CLI in its
-//! headless `stream-json` mode over a piped child process, using the `claude`
-//! binary the person installed and signed in to themselves. Loom never reads,
-//! stores or forwards that login.
+//! headless `stream-json` mode over a piped child process, and [`acp`] drives
+//! Agent Client Protocol (ACP v1) harnesses such as Google's official `agy acp`
+//! over piped JSON-RPC 2.0 stdio. Loom never reads, stores or forwards harness
+//! logins or credentials.
 
+pub mod acp;
 pub mod claude_code;
 
 pub use claude_code::{

@@ -1172,6 +1172,61 @@ fn migrates_a_v20_database_by_adding_the_worktree_integration_column() {
 }
 
 #[test]
+fn migrates_a_v22_database_by_adding_the_session_backend_column() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-v22-{}.db", Uuid::new_v4()));
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_store_meta (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                     next_sequence INTEGER NOT NULL CHECK(next_sequence >= 0)
+                 ) STRICT;
+                 INSERT INTO session_store_meta(singleton, next_sequence) VALUES (1, 1);
+                 CREATE TABLE sessions (
+                     id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
+                     workspace_id BLOB NOT NULL CHECK(length(workspace_id) = 16),
+                     name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+                     goal TEXT,
+                     state TEXT NOT NULL,
+                     title_source TEXT NOT NULL DEFAULT 'auto',
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 ) WITHOUT ROWID, STRICT;
+                 INSERT INTO sessions(id, workspace_id, name, state, title_source, created_at, updated_at)
+                     VALUES (x'00000000000000000000000000000001',
+                             x'00000000000000000000000000000002', 'Legacy', 'idle', 'auto', 10, 10);
+                 PRAGMA user_version = 22;",
+            )
+            .unwrap();
+    }
+
+    let store = FilePersistence::open(&path).unwrap();
+    let loaded = store.load_sessions().unwrap().unwrap();
+    assert_eq!(loaded.sessions.len(), 1);
+    let session = loaded.sessions.values().next().unwrap();
+    assert_eq!(session.name, "Legacy");
+    assert_eq!(session.backend, None);
+    drop(store);
+
+    let connection = Connection::open(&path).unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, DATABASE_SCHEMA_VERSION);
+    let has_column: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name='backend')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(has_column, "the v23 migration adds the backend column");
+    drop(connection);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_status_detects_incompatible_state_and_resets_only_on_request() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     assert_eq!(

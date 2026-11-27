@@ -756,12 +756,17 @@ impl InProcessBackend {
         for handle in handles {
             let mut settled = true;
             if handle.is_running() {
-                handle.control.request_pause();
+                if handle.is_acp {
+                    self.acp_sessions.cancel_pending_permission(handle.run_id);
+                    handle.control.request_interrupt();
+                } else {
+                    handle.control.request_pause();
+                }
                 match handle.wait_until_idle_for(SHUTDOWN_SETTLE_TIMEOUT) {
                     Ok(()) => {
                         if let Some(error) = handle.take_failure() {
                             settle_error.get_or_insert(error);
-                        } else if handle.control.is_stopping() {
+                        } else if !handle.is_acp && handle.control.is_stopping() {
                             let state = handle.state().run.state;
                             // Only active runs need to be parked. Awaiting
                             // approval and waiting for input are already durable,

@@ -358,6 +358,7 @@ fn archiving_project_requires_terminal_children_then_archives_the_tree() {
         created_at,
         updated_at: created_at,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let task = loom_core::DelegatedTaskRecord {
         task_id: loom_core::TaskId::new(),
@@ -853,6 +854,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         created_at,
         updated_at: created_at,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let task = loom_core::DelegatedTaskRecord {
         task_id,
@@ -964,6 +966,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         created_at,
         updated_at: created_at,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     persistence
         .create_project_child(
@@ -1224,6 +1227,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         created_at,
         updated_at: created_at,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     persistence
         .create_project_child(
@@ -2076,6 +2080,7 @@ fn a_terminal_wait_separates_parked_children_from_terminal_ones() {
         created_at,
         updated_at: created_at,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let parked_task = loom_core::DelegatedTaskRecord {
         task_id: parked_task_id,
@@ -2713,6 +2718,7 @@ fn a_child_state_change_journals_the_agent_record_to_its_parent() {
         created_at,
         updated_at: created_at,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let task = loom_core::DelegatedTaskRecord {
         task_id: loom_core::TaskId::new(),
@@ -2885,6 +2891,7 @@ fn auto_archive_policy_archives_a_completed_child_agent() {
             created_at,
             updated_at: created_at,
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         };
         let task = loom_core::DelegatedTaskRecord {
             task_id: loom_core::TaskId::new(),
@@ -3092,6 +3099,7 @@ fn auto_archive_waits_for_code_integration() {
         created_at,
         updated_at: created_at,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let task = loom_core::DelegatedTaskRecord {
         task_id: loom_core::TaskId::new(),

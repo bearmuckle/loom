@@ -196,6 +196,7 @@ mod header_shortcuts {
             created_at: Timestamp::from_unix_millis(10),
             updated_at: Timestamp::from_unix_millis(10),
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         };
         let snapshot = loom_core::ProjectSnapshot {
             project_id: ProjectId::from_uuid(*branch_id.as_uuid()),
@@ -365,6 +366,7 @@ mod header_shortcuts {
             created_at: Timestamp::from_unix_millis(10),
             updated_at: Timestamp::from_unix_millis(10),
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         };
         let snapshot = loom_core::ProjectSnapshot {
             project_id: ProjectId::from_uuid(*branch_id.as_uuid()),
@@ -530,6 +532,7 @@ mod header_shortcuts {
             created_at: Timestamp::from_unix_millis(10),
             updated_at: Timestamp::from_unix_millis(10),
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         };
         let snapshot = loom_core::ProjectSnapshot {
             project_id: ProjectId::from_uuid(*branch_id.as_uuid()),

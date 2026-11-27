@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Who chose the name: the backend from the work, or a person. A manual
     -- rename pins the title and stops automatic re-titling.
     title_source TEXT NOT NULL DEFAULT 'auto' CHECK(title_source IN ('auto', 'manual')),
+    -- Optional JSON backend descriptor for non-native sessions (such as ACP
+    -- harnesses). NULL means Loom's native agent loop.
+    backend TEXT CHECK(backend IS NULL OR length(CAST(backend AS BLOB)) <= 16384),
     created_at INTEGER NOT NULL CHECK(created_at >= 0),
     updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
 ) WITHOUT ROWID, STRICT;
@@ -1456,6 +1459,28 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
             // limits, so a client shows none until the next report.
             21 => {
                 version = 22;
+            }
+            // v23 records an optional JSON backend descriptor on each session
+            // (for example ACP harness metadata, protocol version, and
+            // capabilities). Older rows default to NULL (Loom's native loop).
+            22 => {
+                if migration_table_exists(&transaction, "sessions")?
+                    && !migration_column_exists(&transaction, "sessions", "backend")?
+                {
+                    transaction
+                        .execute_batch(
+                            "ALTER TABLE sessions ADD COLUMN backend TEXT
+                                 CHECK(backend IS NULL
+                                     OR length(CAST(backend AS BLOB)) <= 16384);",
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not migrate persistence schema to v23: {error}"),
+                                true,
+                            )
+                        })?;
+                }
+                version = 23;
             }
             other => return Err(unsupported_database_error(other)),
         }

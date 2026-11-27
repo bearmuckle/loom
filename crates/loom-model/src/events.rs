@@ -107,6 +107,12 @@ pub enum ServerEvent {
     AgentSessionRestored {
         session_id: AgentSessionId,
     },
+    /// The session's backend metadata was updated (for example after an ACP
+    /// harness completed `initialize` and `session/new`).
+    AgentSessionBackendUpdated {
+        session_id: AgentSessionId,
+        backend: loom_core::SessionBackendDescriptor,
+    },
     Agent {
         event: AgentEvent,
     },
@@ -195,6 +201,13 @@ impl ServerEventEnvelope {
             SessionEvent::AgentSessionRestored { session_id } => {
                 ServerEvent::AgentSessionRestored { session_id }
             }
+            SessionEvent::AgentSessionBackendUpdated {
+                session_id,
+                backend,
+            } => ServerEvent::AgentSessionBackendUpdated {
+                session_id,
+                backend,
+            },
         };
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,

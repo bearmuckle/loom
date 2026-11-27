@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "server_restore"
 harness = false
 
+[[test]]
+name = "acp_antigravity"
+harness = false
+
 [build-dependencies]
 loom-build.workspace = true
 
@@ -21,6 +25,7 @@ loom-build.workspace = true
 loom-agent.workspace = true
 loom-context.workspace = true
 loom-core.workspace = true
+loom-harness.workspace = true
 loom-release.workspace = true
 loom-model.workspace = true
 loom-protocol.workspace = true

@@ -39,6 +39,10 @@ pub enum ControlRequest {
     },
 }
 
+fn default_interactive() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum WorkspaceRequest {
@@ -65,6 +69,22 @@ pub enum WorkspaceRequest {
     CreateAgentSessionInWorkspace {
         workspace_id: WorkspaceId,
         name: String,
+    },
+
+    /// Creates a session backed by an external ACP harness (such as
+    /// Antigravity's official `agy acp` binary). Requires the
+    /// `acp_agent_sessions` capability so older clients and workers refuse ACP
+    /// sessions cleanly.
+    CreateAcpAgentSessionInWorkspace {
+        workspace_id: WorkspaceId,
+        name: String,
+        harness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_method: Option<String>,
+        #[serde(default = "default_interactive")]
+        interactive: bool,
     },
 
     GetWorkspaceConfigForWorkspace {
@@ -514,6 +534,17 @@ pub enum ProviderRequest {
 
     GetProviderHealth {
         provider_id: ProviderId,
+    },
+
+    /// Probes an ACP harness binary on the worker (discovery, `initialize`,
+    /// optional `authenticate`/`session/new` model catalog discovery, and policy
+    /// disclosures). Never reads or returns any credential value.
+    ProbeAcpHarness {
+        harness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_method: Option<String>,
     },
 }
 

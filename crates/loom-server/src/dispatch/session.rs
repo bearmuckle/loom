@@ -195,7 +195,15 @@ impl InProcessConnection {
                 policy,
                 auto_approve_actions,
             }) => {
-                self.backend.sessions()?.get(session_id)?;
+                let session = self.backend.sessions()?.get(session_id)?;
+                if session.is_antigravity()
+                    && (auto_approve_actions == Some(true)
+                        || policy == ApprovalPolicy::auto_approve())
+                {
+                    return Err(LoomError::invalid_request(
+                        "Antigravity ACP backend is interactive-only: auto-approve mode is refused.",
+                    ));
+                }
                 self.backend
                     .session_policies()?
                     .insert(session_id, policy.clone());

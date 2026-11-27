@@ -367,6 +367,32 @@ pub enum ProviderResponse {
     },
 
     ProviderHealth(ProviderHealth),
+
+    AcpHarnessProbe(AcpHarnessProbeResult),
+}
+
+/// Discovery and handshake summary returned by [`ProviderRequest::ProbeAcpHarness`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AcpHarnessProbeResult {
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovered_command: Option<String>,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
+    #[serde(default)]
+    pub capabilities: loom_core::AcpCapabilities,
+    #[serde(default)]
+    pub models: Vec<loom_core::AcpModelCatalogEntry>,
+    pub interactive_only: bool,
+    #[serde(default)]
+    pub notices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

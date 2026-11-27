@@ -4807,6 +4807,7 @@ dependencies = [
  "loom-build",
  "loom-context",
  "loom-core",
+ "loom-harness",
  "loom-model",
  "loom-persistence",
  "loom-process",

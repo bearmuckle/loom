@@ -1336,6 +1336,7 @@ fn child_snapshot(
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     }
 }
 

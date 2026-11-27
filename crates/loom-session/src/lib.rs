@@ -2,7 +2,8 @@ use std::{cmp::Reverse, collections::BTreeMap};
 
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, LoomError, Result,
-    SessionEvent, SessionEventRecord, SessionTitleSource, Timestamp, WorkspaceId,
+    SessionBackendDescriptor, SessionEvent, SessionEventRecord, SessionTitleSource, Timestamp,
+    WorkspaceId,
 };
 mod project;
 mod workspace;
@@ -68,6 +69,16 @@ impl SessionManager {
         session_id: AgentSessionId,
         name: impl Into<String>,
     ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        self.create_in_workspace_with_backend(workspace_id, session_id, name, None)
+    }
+
+    pub fn create_in_workspace_with_backend(
+        &mut self,
+        workspace_id: WorkspaceId,
+        session_id: AgentSessionId,
+        name: impl Into<String>,
+        backend: Option<SessionBackendDescriptor>,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
         let name = name.into();
         if name.trim().is_empty() {
             return Err(LoomError::invalid_request(
@@ -90,6 +101,7 @@ impl SessionManager {
             created_at: now,
             updated_at: now,
             title_source: SessionTitleSource::Auto,
+            backend,
         };
         self.sessions.insert(snapshot.id, snapshot.clone());
         let record = self.record(
@@ -97,6 +109,32 @@ impl SessionManager {
             now,
             SessionEvent::AgentSessionCreated {
                 snapshot: snapshot.clone(),
+            },
+        );
+        Ok((snapshot, record))
+    }
+
+    pub fn update_backend(
+        &mut self,
+        session_id: AgentSessionId,
+        backend: SessionBackendDescriptor,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        let now = Timestamp::now();
+        let snapshot = {
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| LoomError::not_found("agent session", session_id))?;
+            session.backend = Some(backend.clone());
+            session.updated_at = now;
+            session.clone()
+        };
+        let record = self.record(
+            session_id,
+            now,
+            SessionEvent::AgentSessionBackendUpdated {
+                session_id,
+                backend,
             },
         );
         Ok((snapshot, record))
@@ -409,6 +447,7 @@ impl SessionManager {
             created_at: now,
             updated_at: now,
             title_source: SessionTitleSource::Auto,
+            backend: source.backend,
         };
         self.sessions.insert(snapshot.id, snapshot.clone());
         let record = self.record(

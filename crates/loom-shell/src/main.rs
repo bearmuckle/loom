@@ -1555,6 +1555,12 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
         ServerEvent::AgentSessionRestored { .. } => {
             println!("session restored");
         }
+        ServerEvent::AgentSessionBackendUpdated { backend, .. } => {
+            println!(
+                "session backend updated -> {}",
+                backend.harness_name().unwrap_or("native")
+            );
+        }
         ServerEvent::Agent { event } => match event {
             AgentEvent::RunStarted { snapshot } => {
                 println!("Run {} [{}]", snapshot.id, run_state_name(snapshot.state));

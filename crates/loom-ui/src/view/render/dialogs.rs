@@ -2329,6 +2329,7 @@ impl LoomView {
                 body = body.child(card);
             }
         }
+        body = body.child(render_antigravity_acp_provider_card());
         body = body.child(self.render_provider_add_form(cx));
         body.into_any_element()
     }
@@ -2404,6 +2405,65 @@ impl LoomView {
         }
         card.into_any_element()
     }
+}
+
+/// Policy disclosures shown on the Antigravity ACP provider card.
+pub(crate) fn antigravity_provider_disclosures() -> [&'static str; 3] {
+    [
+        loom_core::ANTIGRAVITY_TERMS_RISK_NOTICE,
+        loom_core::ANTIGRAVITY_INTERACTIONS_NOTICE,
+        loom_core::ANTIGRAVITY_UNREGISTERED_CLIENT_NOTICE,
+    ]
+}
+
+/// Informational card in Settings -> Providers for the Antigravity (`agy acp`)
+/// ACP harness backend, stating setup, auth methods, and mandatory policy
+/// disclosures (Terms risk, Interactions/training note, unregistered client,
+/// and interactive-only scope).
+fn render_antigravity_acp_provider_card() -> gpui_kit::AnyElement {
+    let mut card = settings_card().child(
+        div()
+            .id("provider-antigravity-acp")
+            .test_support()
+            .w_full()
+            .flex()
+            .items_start()
+            .gap_3()
+            .px_4()
+            .py_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xf3f4f6))
+                            .child("Antigravity (ACP · agy acp)"),
+                    )
+                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                        "Official local ACP harness (`agy acp` / `antigravity-acp`). Auth via \
+                         ACP `authenticate` (`oauth-personal` default or `gemini-api-key` with \
+                         GEMINI_API_KEY in the worker environment). Models come from the harness \
+                         catalog; Loom never reads Google credentials.",
+                    )),
+            )
+            .child(settings_status_pill("interactive-only", false)),
+    );
+    let mut notes = div()
+        .id("provider-antigravity-notices")
+        .test_support()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_4()
+        .pb_3();
+    for notice in antigravity_provider_disclosures() {
+        notes = notes.child(div().text_xs().text_color(rgb(0xfcd34d)).child(notice));
+    }
+    card = card.child(notes);
+    card.into_any_element()
 }
 
 /// The surface a small dialog is drawn on.

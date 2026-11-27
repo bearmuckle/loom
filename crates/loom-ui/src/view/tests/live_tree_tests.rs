@@ -25,6 +25,7 @@ fn listed_session(
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     }
 }
 
@@ -390,6 +391,7 @@ fn a_state_change_by_another_client_reaches_the_row_and_its_project(cx: &mut Tes
             created_at: now,
             updated_at: now,
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         };
         view.sessions.push(child_session);
         view.session_node_ids
@@ -662,6 +664,7 @@ fn a_project_event_elsewhere_reads_that_project_back(cx: &mut TestAppContext) {
             created_at: now,
             updated_at: now,
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         });
         view.session_node_ids
             .insert(root, view.default_backend_node_id.clone());

@@ -12,6 +12,23 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use loom_core::{
+    ANTIGRAVITY_AUTH_GEMINI_API_KEY, ANTIGRAVITY_AUTH_OAUTH_PERSONAL, ANTIGRAVITY_HARNESS_ID,
+    ANTIGRAVITY_INTERACTIONS_NOTICE, ANTIGRAVITY_TERMS_RISK_NOTICE,
+    ANTIGRAVITY_UNREGISTERED_CLIENT_NOTICE, AcpCapabilities, AcpModelCatalogEntry,
+    AcpSessionBackend, CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile, ClonedRepository,
+    ContextAssemblyOptions, ContextBudget, ContextFileKind, ContextFileReference,
+    ContextInspection, ContextItem, ContextItemKind, ContextSummary,
+    DEFAULT_RUN_ADMISSION_TIMEOUT_SECS, GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitHubRepository,
+    JevPolicy, JevSettings, MAX_PROJECT_AGENT_CONCURRENCY, MAX_RUN_ADMISSION_TIMEOUT_SECS,
+    MIN_PROJECT_AGENT_CONCURRENCY, MIN_RUN_ADMISSION_TIMEOUT_SECS, ProjectJevPolicy, RevertResult,
+    SessionBackendDescriptor, SessionDirectory, SessionFilesystemChange, SessionFilesystemFile,
+    SessionFilesystemSnapshot, SessionJevPolicy, SessionRepository, TaskArtifact, TaskEvent,
+    TaskEventRecord, TaskEvidenceLink, TaskKind, TaskSnapshot, TaskSpec, TaskStatus, TerminalEvent,
+    TerminalEventRecord, TerminalSnapshot, TerminalStatus, TerminalStream, UndoResult,
+    WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceEdit,
+    WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
+};
+pub use loom_core::{
     AccessRequestDecision, AccessRequestId, CredentialId, GitHubSignInStatus,
     MAX_ACCESS_REQUEST_NOTE_BYTES, ParticipantId, ParticipantIdentity, PresenceStatus,
     ProviderCredentialMetadata, RosterEntry, RunCredentialPin, SessionAccessRequest,
@@ -20,20 +37,6 @@ pub use loom_core::{
 pub use loom_core::{
     Author, CollaborationEntry, CollaborationEntryKind, MAX_COLLABORATION_TEXT_BYTES, Recipient,
     RunControlAction, RunRevision,
-};
-pub use loom_core::{
-    CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile, ClonedRepository, ContextAssemblyOptions,
-    ContextBudget, ContextFileKind, ContextFileReference, ContextInspection, ContextItem,
-    ContextItemKind, ContextSummary, DEFAULT_RUN_ADMISSION_TIMEOUT_SECS,
-    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitHubRepository, JevPolicy, JevSettings,
-    MAX_PROJECT_AGENT_CONCURRENCY, MAX_RUN_ADMISSION_TIMEOUT_SECS, MIN_PROJECT_AGENT_CONCURRENCY,
-    MIN_RUN_ADMISSION_TIMEOUT_SECS, ProjectJevPolicy, RevertResult, SessionDirectory,
-    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionJevPolicy,
-    SessionRepository, TaskArtifact, TaskEvent, TaskEventRecord, TaskEvidenceLink, TaskKind,
-    TaskSnapshot, TaskSpec, TaskStatus, TerminalEvent, TerminalEventRecord, TerminalSnapshot,
-    TerminalStatus, TerminalStream, UndoResult, WorkerNodeConfig, WorkspaceChangeKind,
-    WorkspaceConfig, WorkspaceControl, WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry,
-    WorkspaceEntryKind, WorkspaceRecord,
 };
 pub use loom_core::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
@@ -416,6 +419,9 @@ impl ClientRequest {
             Self::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace { .. }) => {
                 Some(Capability::CreateAgentSession)
             }
+            Self::Workspace(WorkspaceRequest::CreateAcpAgentSessionInWorkspace { .. }) => {
+                Some(Capability::AcpAgentSessions)
+            }
             Self::Workspace(WorkspaceRequest::GetWorkspaceConfigForWorkspace { .. }) => {
                 Some(Capability::ReadWorkspaceConfig)
             }
@@ -598,6 +604,9 @@ impl ClientRequest {
             }
             Self::Provider(ProviderRequest::GetProviderHealth { .. }) => {
                 Some(Capability::ReadProviderHealth)
+            }
+            Self::Provider(ProviderRequest::ProbeAcpHarness { .. }) => {
+                Some(Capability::AcpAgentSessions)
             }
             Self::Usage(UsageRequest::GetRunUsage { .. }) => Some(Capability::ReadUsage),
             Self::Usage(UsageRequest::GetSessionUsage { .. }) => Some(Capability::ReadUsage),
@@ -963,6 +972,7 @@ impl ClientRequest {
                 | Self::Workspace(WorkspaceRequest::RegisterWorkspace { .. })
                 | Self::Workspace(WorkspaceRequest::RenameWorkspace { .. })
                 | Self::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace { .. })
+                | Self::Workspace(WorkspaceRequest::CreateAcpAgentSessionInWorkspace { .. })
                 | Self::Project(ProjectRequest::CreateSubProject { .. })
                 | Self::Project(ProjectRequest::SetProjectChildModels { .. })
                 | Self::Project(ProjectRequest::ControlProjectChild { .. })
@@ -1605,6 +1615,7 @@ mod run_message_protocol_tests {
                 created_at: loom_core::Timestamp::from_unix_millis(1),
                 updated_at: loom_core::Timestamp::from_unix_millis(1),
                 title_source: loom_core::SessionTitleSource::Auto,
+                backend: None,
             }),
         });
         let encoded = encode_response(&ResponseEnvelope::success(

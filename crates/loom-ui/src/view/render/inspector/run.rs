@@ -69,6 +69,37 @@ impl LoomView {
                         )
                     }),
             )
+            .when_some(
+                acp_backend_badge_info(self.active_session.backend.as_ref()),
+                |column, info| {
+                    column.child(
+                        div()
+                            .id("acp-backend-badge")
+                            .test_support()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Tag::new()
+                                            .with_variant(TagVariant::Info)
+                                            .outline()
+                                            .xsmall()
+                                            .child(info.badge),
+                                    )
+                                    .child(metric_caption(info.command_line)),
+                            )
+                            .child(metric_caption(info.resume_caption))
+                            .child(metric_caption(
+                                "Harness owns context and tools; Loom session limits are not enforced.",
+                            )),
+                    )
+                },
+            )
             .child(
                 div()
                     .w_full()
@@ -320,6 +351,42 @@ impl LoomView {
     }
 }
 
+/// View-model summary for the ACP backend badge and capability-derived resume
+/// affordance rendered in the Run inspector card.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcpBackendBadgeInfo {
+    pub badge: String,
+    pub command_line: String,
+    pub resume_caption: String,
+    pub supports_resume: bool,
+}
+
+pub(crate) fn acp_backend_badge_info(
+    backend: Option<&loom_core::SessionBackendDescriptor>,
+) -> Option<AcpBackendBadgeInfo> {
+    let acp = backend.and_then(loom_core::SessionBackendDescriptor::as_acp)?;
+    let badge = match acp.protocol_version {
+        Some(version) => format!("ACP v{version} · {}", acp.harness),
+        None => format!("ACP · {}", acp.harness),
+    };
+    let command_line = match &acp.auth_method {
+        Some(method) => format!("{} · auth: {method}", acp.command),
+        None => acp.command.clone(),
+    };
+    let supports_resume = acp.capabilities.supports_resume();
+    let resume_caption = if supports_resume {
+        "Harness resume advertised (loadSession/resume)".to_owned()
+    } else {
+        "No journal replay (harness does not advertise loadSession/resume)".to_owned()
+    };
+    Some(AcpBackendBadgeInfo {
+        badge,
+        command_line,
+        resume_caption,
+        supports_resume,
+    })
+}
+
 /// A status pill for the session state, using the component tag so the colors
 /// follow the active theme.
 fn status_tag(state: AgentSessionState) -> Tag {
@@ -569,5 +636,58 @@ mod limit_tests {
             limits_note(&limits("rejected", true)).as_deref(),
             Some("Plan limit reached.")
         );
+    }
+
+    #[test]
+    fn acp_backend_badge_reflects_honest_resume_capability_and_disclosures() {
+        assert_eq!(acp_backend_badge_info(None), None);
+        assert_eq!(
+            acp_backend_badge_info(Some(&loom_core::SessionBackendDescriptor::Native)),
+            None
+        );
+
+        let without_resume =
+            loom_core::SessionBackendDescriptor::acp(loom_core::AcpSessionBackend {
+                harness: loom_core::ANTIGRAVITY_HARNESS_ID.to_owned(),
+                command: "agy acp".to_owned(),
+                protocol_version: Some(1),
+                auth_method: Some(loom_core::ANTIGRAVITY_AUTH_OAUTH_PERSONAL.to_owned()),
+                agent_name: Some("antigravity-acp".to_owned()),
+                agent_version: None,
+                capabilities: loom_core::AcpCapabilities::default(),
+                remote_session_id: Some("s-1".to_owned()),
+                available_models: Vec::new(),
+            });
+        let info = acp_backend_badge_info(Some(&without_resume)).unwrap();
+        assert_eq!(info.badge, "ACP v1 · antigravity");
+        assert!(info.command_line.contains("agy acp"));
+        assert!(info.command_line.contains("oauth-personal"));
+        assert!(!info.supports_resume);
+        assert!(info.resume_caption.contains("No journal replay"));
+
+        let with_resume = loom_core::SessionBackendDescriptor::acp(loom_core::AcpSessionBackend {
+            harness: loom_core::ANTIGRAVITY_HARNESS_ID.to_owned(),
+            command: "agy acp".to_owned(),
+            protocol_version: Some(1),
+            auth_method: Some(loom_core::ANTIGRAVITY_AUTH_GEMINI_API_KEY.to_owned()),
+            agent_name: None,
+            agent_version: None,
+            capabilities: loom_core::AcpCapabilities {
+                load_session: true,
+                ..Default::default()
+            },
+            remote_session_id: None,
+            available_models: Vec::new(),
+        });
+        let info = acp_backend_badge_info(Some(&with_resume)).unwrap();
+        assert!(info.supports_resume);
+        assert!(info.resume_caption.contains("Harness resume advertised"));
+
+        let disclosures = crate::view::render::dialogs::antigravity_provider_disclosures()
+            .join("\n")
+            .to_ascii_lowercase();
+        assert!(disclosures.contains("terms"));
+        assert!(disclosures.contains("interactions"));
+        assert!(disclosures.contains("not a google-registered acp client"));
     }
 }

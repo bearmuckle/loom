@@ -29,6 +29,7 @@ fn archived_session(id: AgentSessionId, name: &str, archived_at: u64) -> AgentSe
         created_at: Timestamp::from_unix_millis(archived_at),
         updated_at: Timestamp::from_unix_millis(archived_at),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     }
 }
 
@@ -1035,6 +1036,7 @@ fn seed_archived_delegated_child(
         created_at,
         updated_at: created_at,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     persistence
         .save_state_with_sessions(&loom_core::SessionManagerState {
@@ -1053,6 +1055,7 @@ fn seed_archived_delegated_child(
         created_at,
         updated_at: created_at,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     // A completed task is not resumed when the worker reopens, so the child
     // stays exactly as the previous run left it.
@@ -1132,6 +1135,7 @@ fn an_archived_sub_agent_of_a_durable_project_is_never_listed(cx: &mut TestAppCo
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         };
         view.open_archived_sessions(cx);
         view
@@ -1493,6 +1497,7 @@ fn deleting_a_project_root_cascades_descendants_out_of_client_state(cx: &mut Tes
             created_at: Timestamp::from_unix_millis(1),
             updated_at: Timestamp::from_unix_millis(1),
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         };
         view.sessions = vec![
             session(root, "Project"),
@@ -1594,6 +1599,7 @@ fn archived_sessions_surface_renders_the_policy_and_the_rows(cx: &mut TestAppCon
                 created_at: Timestamp::from_unix_millis(archived_at),
                 updated_at: Timestamp::from_unix_millis(archived_at),
                 title_source: loom_core::SessionTitleSource::Auto,
+                backend: None,
             };
             view.show_surface(CoveringSurface::ArchivedSessions);
             view.archived_sessions = ArchivedSessionsState {
@@ -1652,6 +1658,7 @@ fn an_archived_row_renders_its_deadline_and_restore_action(cx: &mut TestAppConte
                 created_at: Timestamp::from_unix_millis(archived_at),
                 updated_at: Timestamp::from_unix_millis(archived_at),
                 title_source: loom_core::SessionTitleSource::Auto,
+                backend: None,
             };
             view.show_surface(CoveringSurface::ArchivedSessions);
             view.archived_sessions = ArchivedSessionsState {
@@ -2751,6 +2758,7 @@ fn the_project_context_menu_offers_delete_project_only_for_a_project_root(cx: &m
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let project = project_snapshot(root, &[child]);
 

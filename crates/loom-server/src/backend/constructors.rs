@@ -349,6 +349,7 @@ impl InProcessBackend {
             // so it is supported whether or not a worker enables it; a worker
             // that does not reports the refusal when a sign-in is started.
             Capability::GitHubSignIn,
+            Capability::AcpAgentSessions,
         ];
         if persistence.is_some() {
             supported_capabilities.extend([
@@ -386,6 +387,7 @@ impl InProcessBackend {
             provider_credentials: Arc::new(ProviderCredentialService::default()),
             persistence,
             run_executor: RunExecutor::with_defaults(),
+            acp_sessions: acp_host::AcpSessionManager::default(),
             session_root_base,
             build_cache_base,
             build_cache_retention,

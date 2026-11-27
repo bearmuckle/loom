@@ -384,6 +384,7 @@ impl InProcessConnection {
             created_at: timestamp,
             updated_at: timestamp,
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         };
         let task_id = loom_core::TaskId::new();
         let mut task = loom_core::DelegatedTaskRecord {
