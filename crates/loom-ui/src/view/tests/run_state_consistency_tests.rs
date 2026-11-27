@@ -584,7 +584,8 @@ fn archived_idle_and_queued_states_are_not_overwritten_by_previous_run(cx: &mut 
     cx.update_window(handle.into(), |view, window, cx| {
         let view = view.downcast::<LoomView>().unwrap();
 
-        // 1. Queued session state is not overwritten by the previous Completed run.
+        // 1. Queued session state is not overwritten by the previous Completed run
+        // and does not render the previous run's elapsed timer.
         view.update(cx, |view, _| {
             view.consume_event(&ServerEvent::AgentSessionStateChanged {
                 previous: AgentSessionState::Completed,
@@ -593,20 +594,24 @@ fn archived_idle_and_queued_states_are_not_overwritten_by_previous_run(cx: &mut 
         });
         window.render_frame(cx);
         assert_eq!(window.find("run-status-label").label(), Some("Queued"));
+        assert!(window.try_find("run-status-elapsed").is_none());
         assert!(window.try_find("pause-run").is_none());
         assert!(window.try_find("interrupt-run").is_none());
         view.read_with(cx, |view, _| {
             assert_eq!(view.session_state, AgentSessionState::Queued);
             assert_eq!(view.active_session.state, AgentSessionState::Queued);
+            assert_eq!(view.session_run_presentation().elapsed_ms, None);
             assert!(!view.run_should_poll());
         });
 
-        // 2. Remote archive via workspace lifecycle feed clears a Paused run
-        // and does not get reverted on the next render frame.
+        // 2. Remote archive via workspace lifecycle feed clears a Paused run's
+        // live state without dropping `active_run_id` (needed for transcript
+        // paging and `run_model`) and does not get reverted on the next render.
+        let paused_run_id = RunId::new();
         view.update(cx, |view, cx| {
             let paused = run_snapshot_with_times(
                 view.active_session.id,
-                RunId::new(),
+                paused_run_id,
                 anthropic_sonnet(),
                 AgentRunState::Paused,
                 started_at,
@@ -628,27 +633,89 @@ fn archived_idle_and_queued_states_are_not_overwritten_by_previous_run(cx: &mut 
             );
         });
         window.render_frame(cx);
+        assert!(window.try_find("run-status-elapsed").is_none());
         assert!(window.try_find("pause-run").is_none());
         assert!(window.try_find("resume-run").is_none());
         assert!(window.try_find("interrupt-run").is_none());
         view.read_with(cx, |view, _| {
+            let presentation = view.session_run_presentation();
             assert_eq!(view.session_state, AgentSessionState::Archived);
             assert_eq!(view.active_session.state, AgentSessionState::Archived);
             assert_eq!(view.sessions[0].state, AgentSessionState::Archived);
+            assert_eq!(view.active_run_id, Some(paused_run_id));
+            assert_eq!(presentation.elapsed_ms, None);
+            assert_eq!(presentation.run_model, Some(anthropic_sonnet()));
             assert!(!view.run_should_poll());
         });
 
-        // 3. Restored Idle state stays Idle across renders.
+        // 3. Restored Idle state stays Idle across renders with no stale timer,
+        // while keeping `active_run_id` / `active_run` intact for transcript
+        // paging and follow-up messages.
         view.update(cx, |view, _| {
             let session_id = view.active_session.id;
             view.consume_event(&ServerEvent::AgentSessionRestored { session_id });
         });
         window.render_frame(cx);
         assert_eq!(window.find("run-status-label").label(), Some("Ready"));
+        assert!(window.try_find("run-status-elapsed").is_none());
         view.read_with(cx, |view, _| {
+            let presentation = view.session_run_presentation();
             assert_eq!(view.session_state, AgentSessionState::Idle);
             assert_eq!(view.active_session.state, AgentSessionState::Idle);
+            assert_eq!(view.active_run_id, Some(paused_run_id));
+            assert!(view.active_run.is_some());
+            assert_eq!(presentation.elapsed_ms, None);
+            assert_eq!(presentation.run_model, Some(anthropic_sonnet()));
             assert!(!view.run_should_poll());
+        });
+
+        // 4. Reloading an Archived session at head with a historical fallback
+        // run projection preserves Archived state without clobbering it back
+        // to Completed or dropping `active_run_id`.
+        let historical_run_id = RunId::new();
+        view.update(cx, |view, _| {
+            let session_id = view.active_session.id;
+            view.active_session.state = AgentSessionState::Archived;
+            view.session_state = AgentSessionState::Archived;
+            let archived_fallback = AgentRunSnapshotProjection {
+                run: run_snapshot_with_times(
+                    session_id,
+                    historical_run_id,
+                    anthropic_sonnet(),
+                    AgentRunState::Completed,
+                    started_at,
+                    settled_at,
+                    Some(settled_at),
+                ),
+                plan: Vec::new(),
+                plan_progress: Default::default(),
+                messages: Vec::new(),
+                message_timeline_ordinals: Vec::new(),
+                pending_approval: None,
+                pending_input: None,
+                usage: UsageSnapshot::default(),
+                activities: Vec::new(),
+            };
+            view.rebuild_projection_from_events_after(
+                Vec::new(),
+                Some(EventSequence::new(10)),
+                Some(EventSequence::new(10)),
+                Some(archived_fallback),
+            );
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("run-status-elapsed").is_none());
+        assert!(window.try_find("pause-run").is_none());
+        assert!(window.try_find("resume-run").is_none());
+        assert!(window.try_find("interrupt-run").is_none());
+        view.read_with(cx, |view, _| {
+            let presentation = view.session_run_presentation();
+            assert_eq!(view.session_state, AgentSessionState::Archived);
+            assert_eq!(view.active_session.state, AgentSessionState::Archived);
+            assert_eq!(view.active_run_id, Some(historical_run_id));
+            assert_eq!(presentation.run_state, None);
+            assert_eq!(presentation.elapsed_ms, None);
+            assert_eq!(presentation.run_model, Some(anthropic_sonnet()));
         });
     })
     .unwrap();
@@ -799,8 +866,30 @@ fn elapsed_timer_never_snaps_backwards_on_live_pause_or_block_and_clears_cross_r
             "live pause snapped backwards to {paused_elapsed}ms"
         );
 
-        // Starting a brand-new run clears the previous run's usage so stale
-        // elapsed_ms cannot leak into the new run.
+        // Starting a brand-new run via `adopt_active_run` (as `finish_send_response`
+        // does before `AgentEvent::RunStarted` is polled) clears previous per-run
+        // usage, plan, and activities immediately so stale elapsed_ms cannot leak
+        // into the new run if it pauses before its first usage update.
+        view.review.usage.run_provider = Some(loom_model::ProviderUsageSummary::default());
+        view.plan = Some(PlanState::new(vec!["Old plan step".to_owned()]));
+        view.activity_records.insert(
+            loom_core::ActivityId::new(),
+            AgentActivityRecord {
+                id: loom_core::ActivityId::new(),
+                run_id,
+                timeline_ordinal: 1,
+                parent_id: None,
+                step_id: None,
+                kind: loom_protocol::AgentActivityKind::ModelTurn,
+                status: loom_protocol::AgentActivityStatus::Completed,
+                started_at,
+                completed_at: Some(started_at),
+                elapsed_ms: Some(5_000),
+                data: loom_protocol::AgentActivityData::ModelTurn {
+                    model: anthropic_sonnet(),
+                },
+            },
+        );
         let next_run_id = RunId::new();
         let next_started = Timestamp::now();
         let next_run = run_snapshot_with_times(
@@ -812,11 +901,30 @@ fn elapsed_timer_never_snaps_backwards_on_live_pause_or_block_and_clears_cross_r
             next_started,
             None,
         );
-        view.consume_agent_event(&AgentEvent::RunStarted { snapshot: next_run });
+        view.adopt_active_run(next_run.clone());
         assert!(view.review.usage.run.is_none());
+        assert!(view.review.usage.run_provider.is_none());
+        assert!(view.plan.is_none());
+        assert!(view.activity_records.is_empty());
+
+        view.consume_agent_event(&AgentEvent::RunStarted { snapshot: next_run });
+        view.consume_agent_event(&AgentEvent::RunStateChanged {
+            run_id: next_run_id,
+            state: AgentRunState::Paused,
+        });
+        let next_paused_elapsed = view
+            .session_run_presentation()
+            .elapsed_ms
+            .expect("newly paused run has elapsed time");
+        assert!(
+            next_paused_elapsed < 5_000,
+            "previous run's 5s usage leaked into new run: {next_paused_elapsed}ms"
+        );
 
         // Historical replay uses ActivityRecorded timestamps rather than
-        // wall-clock now(), so an old paused run freezes at its activity time.
+        // wall-clock now(), so an old paused run freezes at its activity time,
+        // and `apply_run_projection` preserves the projection's own seeded plan
+        // and usage after adopting the new run ID.
         let old_start = Timestamp::from_unix_millis(now_ms.saturating_sub(60 * 60 * 1_000));
         let old_activity_end = Timestamp::from_unix_millis(old_start.as_unix_millis() + 42_000);
         let old_run_id = RunId::new();
@@ -830,13 +938,19 @@ fn elapsed_timer_never_snaps_backwards_on_live_pause_or_block_and_clears_cross_r
                 old_start,
                 None,
             ),
-            plan: Vec::new(),
+            plan: vec![loom_protocol::AgentPlanStep {
+                id: "step-1".to_owned(),
+                description: "Replayed step".to_owned(),
+            }],
             plan_progress: Default::default(),
             messages: Vec::new(),
             message_timeline_ordinals: Vec::new(),
             pending_approval: None,
             pending_input: None,
-            usage: UsageSnapshot::default(),
+            usage: UsageSnapshot {
+                elapsed_ms: 12_000,
+                ..UsageSnapshot::default()
+            },
             activities: Vec::new(),
         };
         let activity = AgentActivityRecord {
@@ -885,6 +999,11 @@ fn elapsed_timer_never_snaps_backwards_on_live_pause_or_block_and_clears_cross_r
             Some(fallback),
         );
         assert_eq!(view.session_run_presentation().elapsed_ms, Some(42_000));
+        assert!(view.plan.is_some());
+        assert_eq!(
+            view.review.usage.run.as_ref().map(|u| u.elapsed_ms),
+            Some(12_000)
+        );
 
         view.active_run_id = None;
         view.active_run = None;
@@ -1024,7 +1143,10 @@ fn snapshot_tail_skips_covered_events_and_mid_run_model_switch_survives_refresh(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_kit::init);
-    let now = Timestamp::now();
+    let now_ms = Timestamp::now().as_unix_millis();
+    let historical_start = Timestamp::from_unix_millis(now_ms.saturating_sub(60 * 60 * 1_000));
+    let historical_updated =
+        Timestamp::from_unix_millis(historical_start.as_unix_millis() + 45_000);
     let run_id = RunId::new();
     let switched_model = ModelId::for_provider(
         &loom_model::ProviderId::new("openai"),
@@ -1040,8 +1162,8 @@ fn snapshot_tail_skips_covered_events_and_mid_run_model_switch_survives_refresh(
                 run_id,
                 anthropic_sonnet(),
                 AgentRunState::Evaluating,
-                now,
-                now,
+                historical_start,
+                historical_updated,
                 None,
             ),
             plan: Vec::new(),
@@ -1057,8 +1179,9 @@ fn snapshot_tail_skips_covered_events_and_mid_run_model_switch_survives_refresh(
             activities: Vec::new(),
         };
         // Tail window contains an already-covered UserMessage at seq 5 (<= durable 5)
-        // and no newer run events, while the snapshot reports a newer session state
-        // (Paused) at latest_sequence 8 (> durable 5).
+        // AND a newer non-state event at seq 7 (so `applied > 0`), while the
+        // pause transition at seq 6 aged out before the tail window and is
+        // carried by `snapshot_session_state = Some(Paused)` at latest_sequence 8.
         let covered_event = ServerEventEnvelope {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             sequence: EventSequence::new(5),
@@ -1073,22 +1196,36 @@ fn snapshot_tail_skips_covered_events_and_mid_run_model_switch_survives_refresh(
                 },
             },
         };
+        let non_state_tail_event = ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(7),
+            session_id,
+            event: ServerEvent::AgentSessionRenamed {
+                session_id,
+                name: "Renamed in tail".to_owned(),
+                source: loom_core::SessionTitleSource::Auto,
+            },
+        };
         view.apply_event_snapshot_with_durable(
-            vec![covered_event],
+            vec![covered_event, non_state_tail_event],
             EventSequence::new(8),
             Some(EventSequence::new(5)),
             Some(fallback),
             Some(AgentSessionState::Paused),
         );
-        // Covered UserMessage was not duplicated; newer snapshot session state won.
+        // Covered UserMessage was not duplicated; non-state tail event applied;
+        // newer snapshot session state reconciled even with applied > 0, and
+        // preserved the historical elapsed duration rather than climbing to now().
         let user_rows = view
             .timeline
             .iter()
             .filter(|item| matches!(item, TimelineItem::User(_)))
             .count();
         assert_eq!(user_rows, 1);
+        assert_eq!(view.active_session.name, "Renamed in tail");
         assert_eq!(view.run_state, Some(AgentRunState::Paused));
         assert_eq!(view.session_state, AgentSessionState::Paused);
+        assert_eq!(view.session_run_presentation().elapsed_ms, Some(45_000));
 
         // Mid-run model switch queued in self.model must not revert to
         // active_run.model when self.models is cleared during refresh.

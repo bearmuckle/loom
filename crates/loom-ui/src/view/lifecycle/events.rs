@@ -92,6 +92,7 @@ impl LoomView {
                 }) => {
                     let snapshot_state = session.state;
                     self.active_session = session;
+                    self.session_state = snapshot_state;
                     self.event_stream_epoch = stream_epoch;
                     self.apply_event_snapshot_with_durable(
                         events,
@@ -131,20 +132,35 @@ impl LoomView {
         fallback: Option<AgentRunSnapshotProjection>,
         snapshot_session_state: Option<AgentSessionState>,
     ) {
-        let applied = self.rebuild_projection_from_events_after(
+        let _ = self.rebuild_projection_from_events_after(
             events,
             Some(latest_sequence),
             durable_sequence,
             fallback,
         );
-        // When the event snapshot is strictly newer than the durable fallback
-        // and no newer events were replayed from its window, reconcile with
-        // the snapshot's session state so an aged-out transition is not lost.
-        if applied == 0
-            && let Some(state) = snapshot_session_state
-            && durable_sequence.is_some_and(|durable| latest_sequence > durable)
+        // `SessionEventsSnapshot.session.state` is captured atomically at
+        // `latest_sequence` (the head of `events`). Whenever the snapshot is
+        // strictly newer than the durable baseline (or there was no durable
+        // baseline, or the session is archived at head), reconcile with the
+        // snapshot's session state so a transition that aged out of the tail
+        // window is not lost even when newer non-state events were replayed.
+        if let Some(state) = snapshot_session_state
+            && durable_sequence.is_none_or(|durable| {
+                latest_sequence > durable
+                    || (latest_sequence == durable && state == AgentSessionState::Archived)
+            })
+            && self.after_sequence.is_none_or(|seq| seq <= latest_sequence)
+            && self.session_state != state
         {
+            self.replaying_events = true;
             self.sync_session_state(state);
+            self.replaying_events = false;
+            if self
+                .effective_run_state()
+                .is_some_and(run_state_is_terminal)
+            {
+                finish_assistant_turn(&mut self.timeline);
+            }
         }
     }
 
@@ -642,21 +658,12 @@ impl LoomView {
     pub(crate) fn consume_agent_event(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::RunStarted { snapshot } => {
-                if self.active_run_id != Some(snapshot.id) {
-                    self.transcript_generation = self.transcript_generation.wrapping_add(1);
-                    self.transcript_before_ordinal = None;
-                    self.transcript_loaded_ordinals.clear();
-                    self.transcript_messages.clear();
-                    self.transcript_has_older = false;
-                    self.transcript_loading = false;
-                    self.transcript_prepend_count = 0;
-                    self.activity_records.clear();
-                    // A plan belongs to one run, so a new run starts without one.
-                    self.plan = None;
-                    self.plan_collapsed = false;
-                    self.review.clear_unread(InspectorTab::Run);
-                    self.review.usage.run = None;
-                    self.review.usage.run_provider = None;
+                let stale_replay = self
+                    .active_run
+                    .as_ref()
+                    .is_some_and(|existing| existing.id == snapshot.id);
+                if !stale_replay {
+                    self.adopt_active_run(snapshot.clone());
                 }
                 // The run's task is the prompt that started it. The client that
                 // sent the prompt already shows it, but a run this client only
@@ -674,13 +681,6 @@ impl LoomView {
                         .push(TimelineItem::User(snapshot.task.clone()));
                 }
                 self.context_inspection = None;
-                let stale_replay = self
-                    .active_run
-                    .as_ref()
-                    .is_some_and(|existing| existing.id == snapshot.id);
-                if !stale_replay {
-                    self.adopt_active_run(snapshot.clone());
-                }
                 // A new run streams its own conversation into the open session,
                 // so the transcript below owns the timeline from here; holding
                 // it behind the opening placeholder would only blank the live
@@ -1119,10 +1119,6 @@ impl LoomView {
                 self.run_state = None;
                 self.pending_approval = None;
                 self.pending_input = None;
-                if matches!(state, AgentSessionState::Archived | AgentSessionState::Idle) {
-                    self.active_run_id = None;
-                    self.active_run = None;
-                }
             }
         }
         self.update_session_list();
@@ -1169,20 +1165,25 @@ impl LoomView {
     }
 
     pub(crate) fn apply_run_projection(&mut self, projection: AgentRunSnapshotProjection) {
-        self.seed_plan_from_projection(&projection);
+        let was_archived = self.session_state == AgentSessionState::Archived;
         self.adopt_active_run(projection.run.clone());
-        let adopted_state = self.run_state.unwrap_or(projection.run.state);
-        if matches!(
-            adopted_state,
-            AgentRunState::AwaitingApproval | AgentRunState::Paused
-        ) {
-            self.pending_approval = projection.pending_approval;
-        }
-        if matches!(
-            adopted_state,
-            AgentRunState::NeedsInput | AgentRunState::Paused
-        ) {
-            self.pending_input = projection.pending_input;
+        self.seed_plan_from_projection(&projection);
+        if was_archived {
+            self.sync_session_state(AgentSessionState::Archived);
+        } else {
+            let adopted_state = self.run_state.unwrap_or(projection.run.state);
+            if matches!(
+                adopted_state,
+                AgentRunState::AwaitingApproval | AgentRunState::Paused
+            ) {
+                self.pending_approval = projection.pending_approval;
+            }
+            if matches!(
+                adopted_state,
+                AgentRunState::NeedsInput | AgentRunState::Paused
+            ) {
+                self.pending_input = projection.pending_input;
+            }
         }
         self.review.usage.run =
             (projection.usage != UsageSnapshot::default()).then_some(projection.usage);
