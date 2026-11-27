@@ -1,5 +1,5 @@
-//! Provider verbs: list the worker's providers and their models, and store an
-//! API key.
+//! Provider verbs: list the worker's providers and their models, store an API
+//! key, and run the worker-side GitHub Copilot device-login flow.
 //!
 //! `providers list` is a read. It prints each provider as
 //! `id=<id> kind=<kind> credential=<true|false> api-key-configurable=<true|false>`
@@ -9,22 +9,40 @@
 //! marks exactly one default per provider. `providers set-key` sends
 //! `Provider/ConfigureApiKeyProvider`, the same request the settings screen
 //! sends, and reads the key from an environment variable or a file so the key
-//! never appears on the command line. The worker stores the secret in its own
-//! credential store; this client does not write one.
+//! never appears on the command line. `providers login` and `providers
+//! login-status` send `Provider/StartGitHubCopilotLogin` and
+//! `Provider/GetGitHubCopilotLoginStatus`, the same device-login path loom-ui
+//! uses: the worker performs the OAuth exchange and stores the credential, and
+//! this client handles only the public verification URL, user code, opaque
+//! login id, and status, over a secure connection (`wss://` or loopback
+//! `ws://`). The worker stores secrets in its own credential store; this
+//! client does not write one.
 
-use std::{env, fs, io::Write, path::Path};
+use std::{env, fs, io::Write, path::Path, time::Duration};
 
+use loom_core::{ErrorCode, LoomError};
 use loom_model::{
     DEEPSEEK_DEFAULT_MODEL, GITHUB_COPILOT_DEFAULT_MODEL, ModelDescriptor, ModelId,
     OPENAI_DEFAULT_MODEL, ProviderKind, ProviderSummary,
 };
-use loom_protocol::{ClientRequest, ProviderRequest, ProviderResponse, ServerResponse};
+use loom_protocol::{
+    ClientRequest, GitHubCopilotLoginStatus, ProviderRequest, ProviderResponse, ServerResponse,
+};
 use serde_json::{Value, json};
 
-use crate::cli::args::{Invocation, ProviderAddArgs, ProviderKeySource, ProviderSetKeyArgs};
+use crate::cli::args::{
+    INSECURE_COPILOT_LOGIN_MESSAGE, Invocation, ProviderAddArgs, ProviderKeySource,
+    ProviderLoginArgs, ProviderSetKeyArgs,
+};
 use crate::cli::client::Client;
+use crate::cli::exit;
+use crate::cli::text::escape;
 
 use super::{Caller, Failure, Outcome, emit, handshake};
+
+/// Poll interval clamp matching `loom-ui`'s `start_github_login_flow`.
+const MIN_LOGIN_POLL_INTERVAL_SECS: u64 = 1;
+const MAX_LOGIN_POLL_INTERVAL_SECS: u64 = 10;
 
 /// `providers list`: the providers the worker has registered.
 pub(super) async fn list<C: Client>(
@@ -275,6 +293,213 @@ pub(super) async fn set_key<C: Client>(
     ))
 }
 
+/// `providers login`: start the worker's GitHub Copilot device-login flow,
+/// print only the public verification URL and user code, and optionally poll
+/// until the flow completes, fails, or times out.
+pub(super) async fn login<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    args: &ProviderLoginArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    ensure_secure_connection(client, invocation)?;
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let (request_id, response) = caller
+        .call(ClientRequest::Provider(
+            ProviderRequest::StartGitHubCopilotLogin,
+        ))
+        .await?;
+    let (login_id, user_code, verification_uri, expires_in, interval) = match response {
+        ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStarted {
+            login_id,
+            user_code,
+            verification_uri,
+            expires_in,
+            interval,
+        }) => (login_id, user_code, verification_uri, expires_in, interval),
+        _ => {
+            return Err(Failure::unexpected(
+                request_id,
+                "GitHub Copilot login start",
+            ));
+        }
+    };
+
+    let safe_uri = escape(&verification_uri);
+    let safe_code = escape(&user_code);
+    let safe_login_id = escape(&login_id);
+
+    if !invocation.globals.json {
+        if args.no_wait {
+            emit(
+                out,
+                &format!("url {safe_uri}\nuser_code {safe_code}\nlogin_id {safe_login_id}\n"),
+            )?;
+        } else {
+            emit(out, &format!("url {safe_uri}\nuser_code {safe_code}\n"))?;
+            let _ = out.flush();
+        }
+    } else if !args.no_wait {
+        // Under `--json` without `--no-wait`, stdout must remain a single final
+        // JSON envelope, so emit the public verification URL and user code on
+        // stderr and flush before blocking in the poll loop.
+        emit(
+            err,
+            &format!("url {safe_uri}\nuser_code {safe_code}\nlogin_id {safe_login_id}\n"),
+        )?;
+        let _ = err.flush();
+    }
+
+    if args.no_wait {
+        return Ok(Outcome::new(
+            json!({
+                "provider": args.provider,
+                "login_id": login_id,
+                "url": verification_uri,
+                "user_code": user_code,
+                "expires_in": expires_in,
+                "interval": interval,
+                "status": "pending",
+            }),
+            caller.primary,
+        ));
+    }
+
+    let poll_interval = clamped_poll_interval(interval);
+    let timeout_secs = args.timeout_secs.unwrap_or(expires_in);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+    loop {
+        let (request_id, response) = caller
+            .call(ClientRequest::Provider(
+                ProviderRequest::GetGitHubCopilotLoginStatus {
+                    login_id: login_id.clone(),
+                },
+            ))
+            .await?;
+        let status = match response {
+            ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus { status }) => {
+                status
+            }
+            _ => {
+                return Err(Failure::unexpected(
+                    request_id,
+                    "GitHub Copilot login status",
+                ));
+            }
+        };
+        match status {
+            GitHubCopilotLoginStatus::Configured => {
+                if !invocation.globals.json {
+                    emit(out, "status configured\n")?;
+                }
+                return Ok(Outcome::new(
+                    json!({
+                        "provider": args.provider,
+                        "login_id": login_id,
+                        "url": verification_uri,
+                        "user_code": user_code,
+                        "expires_in": expires_in,
+                        "interval": interval,
+                        "status": "configured",
+                    }),
+                    caller.primary,
+                ));
+            }
+            GitHubCopilotLoginStatus::Failed { message } => {
+                return Err(Failure::Server {
+                    request_id,
+                    error: LoomError::new(ErrorCode::Internal, message, false),
+                });
+            }
+            GitHubCopilotLoginStatus::Pending => {}
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(Failure::Timeout {
+                request_id: caller.primary,
+                message: format!(
+                    "GitHub Copilot login {login_id} did not complete within {timeout_secs}s"
+                ),
+            });
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(poll_interval.min(remaining)).await;
+    }
+}
+
+/// `providers login-status`: one poll of an in-flight GitHub Copilot device
+/// login. Text prints only the status word; `--json` reports
+/// `{login_id, status, message?}`. Exit `0` for `configured`, `4` for
+/// `pending`, and `1` for `failed`.
+pub(super) async fn login_status<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    login_id: &str,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    ensure_secure_connection(client, invocation)?;
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let (request_id, response) = caller
+        .call(ClientRequest::Provider(
+            ProviderRequest::GetGitHubCopilotLoginStatus {
+                login_id: login_id.to_owned(),
+            },
+        ))
+        .await?;
+    let status = match response {
+        ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus { status }) => status,
+        _ => {
+            return Err(Failure::unexpected(
+                request_id,
+                "GitHub Copilot login status",
+            ));
+        }
+    };
+    let (word, data, code) = match status {
+        GitHubCopilotLoginStatus::Configured => (
+            "configured",
+            json!({ "login_id": login_id, "status": "configured" }),
+            exit::OK,
+        ),
+        GitHubCopilotLoginStatus::Pending => (
+            "pending",
+            json!({ "login_id": login_id, "status": "pending" }),
+            exit::TIMEOUT,
+        ),
+        GitHubCopilotLoginStatus::Failed { message } => (
+            "failed",
+            json!({ "login_id": login_id, "status": "failed", "message": message }),
+            exit::INTERNAL,
+        ),
+    };
+    if !invocation.globals.json {
+        emit(out, &format!("{word}\n"))?;
+    }
+    Ok(Outcome::new(data, caller.primary).with_code(code))
+}
+
+fn ensure_secure_connection<C: Client>(client: &C, invocation: &Invocation) -> Result<(), Failure> {
+    if !client.is_secure_for_secrets() {
+        return Err(Failure::Usage(INSECURE_COPILOT_LOGIN_MESSAGE.to_owned()));
+    }
+    if let Some(url) = invocation.globals.connect.as_deref()
+        && !loom_local::remote_url_is_secure_for_secrets(url)
+    {
+        return Err(Failure::Usage(INSECURE_COPILOT_LOGIN_MESSAGE.to_owned()));
+    }
+    Ok(())
+}
+
+fn clamped_poll_interval(interval_secs: u64) -> Duration {
+    Duration::from_secs(
+        interval_secs.clamp(MIN_LOGIN_POLL_INTERVAL_SECS, MAX_LOGIN_POLL_INTERVAL_SECS),
+    )
+}
+
 fn provider_line(provider: &ProviderSummary) -> String {
     format!(
         "id={} kind={} credential={} api-key-configurable={}",
@@ -479,5 +704,15 @@ mod tests {
         ] {
             assert_eq!(declared_default(kind), expected, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn login_poll_interval_clamps_to_ui_bounds() {
+        use std::time::Duration;
+        assert_eq!(super::clamped_poll_interval(0), Duration::from_secs(1));
+        assert_eq!(super::clamped_poll_interval(1), Duration::from_secs(1));
+        assert_eq!(super::clamped_poll_interval(5), Duration::from_secs(5));
+        assert_eq!(super::clamped_poll_interval(10), Duration::from_secs(10));
+        assert_eq!(super::clamped_poll_interval(30), Duration::from_secs(10));
     }
 }

@@ -43,7 +43,7 @@ use crate::cli::{client::Client, exit};
 
 /// Why a verb produced no success payload.
 #[derive(Debug)]
-pub(crate) enum Failure {
+pub enum Failure {
     /// The command line itself was wrong.
     Usage(String),
     /// Local input or output failed, such as an unreadable cursor file.
@@ -73,7 +73,7 @@ pub(crate) enum Failure {
 }
 
 impl Failure {
-    pub(crate) fn exit_code(&self) -> i32 {
+    pub fn exit_code(&self) -> i32 {
         match self {
             Self::Usage(_) => exit::USAGE,
             Self::Internal(_) => exit::INTERNAL,
@@ -87,7 +87,7 @@ impl Failure {
 
     /// The protocol error code, which a usage or local failure reports as
     /// `invalid_request` or `internal`.
-    pub(crate) fn code(&self) -> String {
+    pub fn code(&self) -> String {
         match self {
             Self::Usage(_) => ErrorCode::InvalidRequest.to_string(),
             Self::Internal(_) => ErrorCode::Internal.to_string(),
@@ -98,7 +98,7 @@ impl Failure {
         }
     }
 
-    pub(crate) fn message(&self) -> &str {
+    pub fn message(&self) -> &str {
         match self {
             Self::Usage(message) | Self::Internal(message) => message,
             Self::BrokenPipe => "the output stream was closed",
@@ -108,7 +108,7 @@ impl Failure {
         }
     }
 
-    fn retryable(&self) -> bool {
+    pub fn retryable(&self) -> bool {
         match self {
             Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe => false,
             // A bounded poll that reached its deadline can be resumed: the
@@ -120,7 +120,7 @@ impl Failure {
         }
     }
 
-    fn request_id(&self) -> Option<RequestId> {
+    pub fn request_id(&self) -> Option<RequestId> {
         match self {
             Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe => None,
             Self::Provider(_) => None,
@@ -130,11 +130,11 @@ impl Failure {
     }
 
     /// The failure envelope of the `--json` contract.
-    pub(crate) fn envelope(&self, verb: &str) -> Value {
+    pub fn envelope(&self, verb: &str) -> Value {
         self.envelope_with_code(verb, self.exit_code())
     }
 
-    pub(crate) fn envelope_with_code(&self, verb: &str, exit_code: i32) -> Value {
+    pub fn envelope_with_code(&self, verb: &str, exit_code: i32) -> Value {
         serde_json::json!({
             "ok": false,
             "verb": verb,
@@ -174,7 +174,7 @@ impl Failure {
 /// the id of its primary request, and the exit code it reports. A blocked
 /// `wait` and a `liveness` verdict that is `gone` or `unknown` are successful
 /// determinations that still report the documented non-zero code.
-pub(crate) struct Outcome {
+pub struct Outcome {
     pub data: Value,
     pub request_id: Option<RequestId>,
     pub exit_code: i32,
@@ -184,7 +184,7 @@ pub(crate) struct Outcome {
 }
 
 impl Outcome {
-    pub(crate) fn new(data: Value, request_id: Option<RequestId>) -> Self {
+    pub fn new(data: Value, request_id: Option<RequestId>) -> Self {
         Self {
             data,
             request_id,
@@ -193,12 +193,12 @@ impl Outcome {
         }
     }
 
-    pub(crate) fn with_code(mut self, exit_code: i32) -> Self {
+    pub fn with_code(mut self, exit_code: i32) -> Self {
         self.exit_code = exit_code;
         self
     }
 
-    pub(crate) fn with_replayed(mut self, replayed: bool) -> Self {
+    pub fn with_replayed(mut self, replayed: bool) -> Self {
         self.replayed = replayed;
         self
     }
@@ -305,7 +305,11 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
         Verb::ProvidersList | Verb::ModelsList { .. } => {
             capabilities.push(Capability::ListProviders);
         }
-        Verb::ProvidersSetKey(_) | Verb::ProvidersAdd(_) | Verb::ProvidersRemove { .. } => {
+        Verb::ProvidersSetKey(_)
+        | Verb::ProvidersAdd(_)
+        | Verb::ProvidersRemove { .. }
+        | Verb::ProvidersLogin(_)
+        | Verb::ProvidersLoginStatus { .. } => {
             capabilities.push(Capability::ConfigureProviders);
         }
         Verb::ProvidersDiscover { .. } => capabilities.push(Capability::ListProviders),
@@ -784,6 +788,10 @@ pub(crate) async fn run<C: Client>(
         }
         Verb::ProvidersDiscover { provider } => {
             providers::discover(client, invocation, provider, out).await
+        }
+        Verb::ProvidersLogin(args) => providers::login(client, invocation, args, out, err).await,
+        Verb::ProvidersLoginStatus { login_id } => {
+            providers::login_status(client, invocation, login_id, out).await
         }
         Verb::JevStatus(flags) => jev::status(client, invocation, flags, out).await,
         Verb::JevAsk(args) => jev::ask(client, invocation, args, out).await,

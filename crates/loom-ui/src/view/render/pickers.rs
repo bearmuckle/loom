@@ -257,7 +257,10 @@ impl LoomView {
                                                     if view.browser_connection_lost.is_some() {
                                                         view.retry_worker_connection(cx);
                                                     } else {
-                                                        view.open_settings_from_menu(cx);
+                                                        view.open_settings_section(
+                                                            SettingsSection::Workers,
+                                                            cx,
+                                                        );
                                                     }
                                                 })),
                                         )
@@ -265,6 +268,7 @@ impl LoomView {
                                             row.child(
                                                 Button::new("workspace-status-settings")
                                                     .icon(Icon::new(IconName::Settings))
+                                                    .accessibility_label("Open Settings")
                                                     .ghost()
                                                     .when(layout.phone, |button| {
                                                         button
@@ -274,7 +278,10 @@ impl LoomView {
                                                     })
                                                     .when(!layout.phone, |button| button.xsmall())
                                                     .on_click(cx.listener(|view, _, _, cx| {
-                                                        view.open_settings_from_menu(cx);
+                                                        view.open_settings_section(
+                                                            SettingsSection::Workers,
+                                                            cx,
+                                                        );
                                                     })),
                                             )
                                         }),
@@ -319,6 +326,30 @@ impl LoomView {
             .token_input
             .clone()
             .expect("setup token input initialized before rendering");
+        let heading = if existing.is_some() {
+            "Worker not reachable"
+        } else {
+            "Set up a worker"
+        };
+        let description = match &existing {
+            Some(worker) => format!(
+                "Loom could not reach the worker you set up at {}. It may still be starting, so \
+                 retry first; reinstalling restarts the worker and stops its current work.",
+                worker.url
+            ),
+            None => "Loom's client needs a worker to run sessions. Connect to a worker you \
+                     already run, or install one on this machine."
+                .to_owned(),
+        };
+        let connect_heading = if existing.is_some() {
+            "Or connect to a different worker"
+        } else {
+            "Connect to a worker"
+        };
+        let connect_hint = "ws://host:port/ws with its access token, or ssh://user@host to \
+                            install a worker over SSH.";
+        let install_hint = "Downloads the latest loom-server release and runs it as a user \
+                            service that also starts at boot.";
         div()
             .size_full()
             .relative()
@@ -335,6 +366,8 @@ impl LoomView {
                         div()
                             .id("worker-setup-card")
                             .test_support()
+                            .role(Role::Region)
+                            .aria_label(heading)
                             .w_full()
                             .max_w(px(560.))
                             .flex()
@@ -347,32 +380,30 @@ impl LoomView {
                             .border_color(rgb(0x293244))
                             .child(
                                 div()
+                                    .id("worker-setup-heading")
+                                    .test_support()
+                                    .role(Role::Heading)
+                                    .aria_level(1)
+                                    .aria_label(heading)
                                     .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(if existing.is_some() {
-                                        "Worker not reachable"
-                                    } else {
-                                        "Set up a worker"
-                                    }),
+                                    .child(heading),
                             )
-                            .child(div().text_sm().text_color(rgb(0x8f98a6)).child(
-                                match &existing {
-                                    Some(worker) => format!(
-                                        "Loom could not reach the worker you set up at {}. It may \
-                                         still be starting, so retry first; reinstalling restarts \
-                                         the worker and stops its current work.",
-                                        worker.url
-                                    ),
-                                    None => "Loom's client needs a worker to run sessions. \
-                                             Install one on this machine, or connect to a worker \
-                                             you already run."
-                                        .to_owned(),
-                                },
-                            ))
+                            .child(
+                                div()
+                                    .id("worker-setup-description")
+                                    .test_support()
+                                    .role(Role::Label)
+                                    .aria_label(description.clone())
+                                    .text_sm()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child(description),
+                            )
                             .when_some(existing.clone(), |card, _| {
                                 card.child(
                                     Button::new("worker-setup-retry")
                                         .label("Retry")
+                                        .primary()
                                         .small()
                                         .disabled(busy)
                                         .when(layout.phone, |button| {
@@ -384,41 +415,38 @@ impl LoomView {
                                 )
                             })
                             .child(
-                                Button::new("worker-setup-install")
-                                    .label(if existing.is_some() {
-                                        "Reinstall or update (restarts the worker)"
-                                    } else {
-                                        "Install a worker on this machine"
-                                    })
-                                    .when(existing.is_some(), |button| button.ghost())
-                                    .small()
-                                    .disabled(busy)
-                                    .when(layout.phone, |button| button.h(layout.control_size()))
-                                    .on_click(
-                                        cx.listener(|view, _, _, cx| view.install_local_worker(cx)),
-                                    ),
+                                div()
+                                    .id("worker-setup-connect-heading")
+                                    .test_support()
+                                    .role(Role::Heading)
+                                    .aria_level(2)
+                                    .aria_label(connect_heading)
+                                    .text_sm()
+                                    .child(connect_heading),
                             )
-                            .child(div().text_xs().text_color(rgb(0x64748b)).child(
-                                "Downloads the latest loom-server release and runs it as a user \
-                                 service that also starts at boot.",
-                            ))
-                            .child(div().h(px(1.)).w_full().bg(rgb(0x293244)))
-                            .child(div().text_sm().child("Or connect to an existing worker"))
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .gap_2()
-                                    .child(KitInput::new(&url_input).id("worker-setup-url").small())
+                                    .child(
+                                        KitInput::new(&url_input)
+                                            .id("worker-setup-url")
+                                            .aria_label("Worker URL")
+                                            .small(),
+                                    )
                                     .child(
                                         KitInput::new(&token_input)
                                             .id("worker-setup-token")
+                                            .aria_label("Access token (optional)")
+                                            .content_type(InputContentType::Password)
                                             .small(),
                                     )
                                     .child(
                                         div().flex().justify_end().child(
                                             Button::new("worker-setup-connect")
                                                 .label("Connect")
+                                                .when(existing.is_none(), Button::primary)
                                                 .small()
                                                 .disabled(busy)
                                                 .when(layout.phone, |button| {
@@ -430,15 +458,23 @@ impl LoomView {
                                         ),
                                     ),
                             )
-                            .child(div().text_xs().text_color(rgb(0x64748b)).child(
-                                "ws://host:port/ws with its access token, or ssh://user@host to \
-                                 install a worker over SSH.",
-                            ))
+                            .child(
+                                div()
+                                    .id("worker-setup-connect-hint")
+                                    .test_support()
+                                    .role(Role::Label)
+                                    .aria_label(connect_hint)
+                                    .text_xs()
+                                    .text_color(rgb(0x64748b))
+                                    .child(connect_hint),
+                            )
                             .when_some(progress, |card, progress| {
                                 card.child(
                                     div()
                                         .id("worker-setup-progress")
                                         .test_support()
+                                        .role(Role::Status)
+                                        .aria_label(progress.clone())
                                         .text_xs()
                                         .text_color(rgb(0xfcd34d))
                                         .child(progress),
@@ -449,11 +485,52 @@ impl LoomView {
                                     div()
                                         .id("worker-setup-error")
                                         .test_support()
+                                        .role(Role::Alert)
+                                        .aria_label(error.clone())
                                         .text_xs()
                                         .text_color(rgb(0xfca5a5))
                                         .child(error),
                                 )
-                            }),
+                            })
+                            .child(div().h(px(1.)).w_full().bg(rgb(0x293244)))
+                            .when(existing.is_none(), |card| {
+                                card.child(
+                                    div()
+                                        .id("worker-setup-install-heading")
+                                        .test_support()
+                                        .role(Role::Heading)
+                                        .aria_level(2)
+                                        .aria_label("Or install on this machine")
+                                        .text_sm()
+                                        .child("Or install on this machine"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("worker-setup-install-hint")
+                                    .test_support()
+                                    .role(Role::Label)
+                                    .aria_label(install_hint)
+                                    .text_xs()
+                                    .text_color(rgb(0x64748b))
+                                    .child(install_hint),
+                            )
+                            .child(
+                                Button::new("worker-setup-install")
+                                    .label(if existing.is_some() {
+                                        "Reinstall or update (restarts the worker)"
+                                    } else {
+                                        "Install a worker on this machine"
+                                    })
+                                    .when(existing.is_some(), |button| button.ghost())
+                                    .when(existing.is_none(), |button| button.outline())
+                                    .small()
+                                    .disabled(busy)
+                                    .when(layout.phone, |button| button.h(layout.control_size()))
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.install_local_worker(cx)),
+                                    ),
+                            ),
                     ),
             )
             .into_any()
@@ -465,13 +542,25 @@ impl LoomView {
             .as_ref()
             .is_some_and(|setup| setup.url_input.is_none())
         {
+            let auto_focus = self
+                .setup
+                .as_ref()
+                .is_some_and(|setup| setup.existing.is_none());
             let input = cx.new(|cx| {
                 InputState::new(window, cx).placeholder("ws://127.0.0.1:8765/ws or ssh://user@host")
             });
+            if auto_focus {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
             self.input_subscriptions.push(cx.subscribe(
                 &input,
                 |view, _, event: &InputEvent, cx| match event {
-                    InputEvent::Change => cx.notify(),
+                    InputEvent::Change => {
+                        if let Some(setup) = view.setup.as_mut() {
+                            setup.error = None;
+                        }
+                        cx.notify();
+                    }
                     InputEvent::PressEnter { .. } => view.connect_setup_worker(cx),
                     _ => {}
                 },
@@ -490,12 +579,19 @@ impl LoomView {
                     .placeholder("Access token (optional)")
                     .masked(true)
             });
-            self.input_subscriptions
-                .push(cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
+            self.input_subscriptions.push(cx.subscribe(
+                &input,
+                |view, _, event: &InputEvent, cx| match event {
+                    InputEvent::Change => {
+                        if let Some(setup) = view.setup.as_mut() {
+                            setup.error = None;
+                        }
                         cx.notify();
                     }
-                }));
+                    InputEvent::PressEnter { .. } => view.connect_setup_worker(cx),
+                    _ => {}
+                },
+            ));
             if let Some(setup) = self.setup.as_mut() {
                 setup.token_input = Some(input);
             }

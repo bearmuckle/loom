@@ -1,0 +1,34 @@
+[package]
+name = "loom-mcp"
+description = "MCP control plane: mirrors loom-cli over streamable HTTP or stdio."
+version.workspace = true
+edition.workspace = true
+license = "AGPL-3.0-only"
+rust-version.workspace = true
+
+[[bin]]
+name = "loom-mcp"
+path = "src/bin/loom-mcp.rs"
+
+[dependencies]
+loom-cli.workspace = true
+loom-core.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+subtle.workspace = true
+sha2.workspace = true
+
+# The tests drive the verbs against a real in-process worker served over the
+# WebSocket transport, then exercise the streamable HTTP endpoint end to end.
+[dev-dependencies]
+loom-core.workspace = true
+loom-protocol.workspace = true
+loom-server.workspace = true
+reqwest.workspace = true

@@ -45,6 +45,11 @@ pub(crate) const DEFAULT_JEV_THRESHOLD: f64 = 0.9;
 pub(crate) const MAX_JEV_STATE_BYTES: usize = 128 * 1024;
 /// The most choice labels one Jev question may offer.
 pub(crate) const MAX_JEV_OPTIONS: usize = 255;
+/// The error reported when a device-login verb targets a plaintext non-loopback
+/// worker URL. `--allow-insecure-remote` never overrides this rule.
+pub(crate) const INSECURE_COPILOT_LOGIN_MESSAGE: &str = "GitHub Copilot sign-in requires a secure \
+     worker connection (wss:// or loopback ws://); --allow-insecure-remote does not override this \
+     check";
 
 pub(crate) const HELP: &str = r#"Usage: loom-cli <verb> [flags]
 
@@ -137,6 +142,14 @@ Verbs:
             (--from-env <NAME> | --key-file <path>)
                                     store an API key for openai, deepseek, or
                                     an openai-compatible provider
+  providers login --provider github-copilot [--no-wait] [--timeout <seconds>]
+                                    start the GitHub Copilot device-login flow
+                                    on the worker, print the public verification
+                                    URL and user code, and poll until finished;
+                                    requires wss:// or loopback ws://
+  providers login-status --login-id <id>
+                                    poll the status of a GitHub Copilot device
+                                    login once (pending, configured, or failed)
   jev status [--source opencode|typesafe] [--key-file <path>]
              [--endpoint <url>] [--model <id>]
                                     report whether a Jev key is configured,
@@ -421,6 +434,12 @@ key, which is stored once per provider id. `providers discover` replaces the
 models with the endpoint's own `/models` catalog, and `providers remove` drops
 the provider and its stored key. A built-in provider (openai, deepseek,
 ollama, github-copilot, deterministic) can be neither redefined nor removed.
+`github-copilot` is not api-key-configurable: sign in with `providers login
+--provider github-copilot` (and poll separately with `--no-wait` and
+`providers login-status --login-id <id>`), which runs the device flow on the
+worker over a secure connection (`wss://` or loopback `ws://`;
+`--allow-insecure-remote` never overrides this check) and never handles a token
+on the client.
 
 Exit codes: 0 ok, 1 internal, 2 usage, 3 blocked, 4 timeout, 5 not found or
 gone, 6 protocol or auth mismatch, 7 transport unreachable.
@@ -696,6 +715,19 @@ pub(crate) struct ProviderSetKeyArgs {
     pub source: ProviderKeySource,
 }
 
+/// The flags of `providers login`.
+///
+/// The client never performs the OAuth exchange or touches a token: it asks the
+/// worker to start the device flow, prints only the public verification URL and
+/// user code, and optionally polls until the worker finishes storing the
+/// credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderLoginArgs {
+    pub provider: String,
+    pub no_wait: bool,
+    pub timeout_secs: Option<u64>,
+}
+
 /// The flags of `providers add`.
 ///
 /// The provider is an OpenAI-compatible gateway the operator supplies: its id,
@@ -902,6 +934,13 @@ pub(crate) enum Verb {
     ProvidersDiscover {
         provider: String,
     },
+    /// `providers login`: start the GitHub Copilot device-login flow on the
+    /// worker and optionally poll until it completes.
+    ProvidersLogin(ProviderLoginArgs),
+    /// `providers login-status`: poll one in-flight GitHub Copilot device login.
+    ProvidersLoginStatus {
+        login_id: String,
+    },
     /// `jev status`: the key, endpoint, and model a Jev call would use.
     JevStatus(JevFlags),
     /// `jev ask`: one raw choice question to the decision model.
@@ -1068,6 +1107,8 @@ impl Verb {
             | Verb::ProvidersAdd(_)
             | Verb::ProvidersRemove { .. }
             | Verb::ProvidersDiscover { .. }
+            | Verb::ProvidersLogin(_)
+            | Verb::ProvidersLoginStatus { .. }
             | Verb::JevStatus(_)
             | Verb::JevAsk(_)
             | Verb::JevTriage(_)
@@ -1195,6 +1236,8 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::ProvidersAdd(_) => "providers add",
         Verb::ProvidersRemove { .. } => "providers remove",
         Verb::ProvidersDiscover { .. } => "providers discover",
+        Verb::ProvidersLogin(_) => "providers login",
+        Verb::ProvidersLoginStatus { .. } => "providers login-status",
         Verb::JevStatus(_) => "jev status",
         Verb::JevAsk(_) => "jev ask",
         Verb::JevTriage(_) => "jev triage",
@@ -1233,6 +1276,15 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
 /// triage` reads one session from the worker and is therefore not local.
 pub(crate) fn is_local(verb: &Verb) -> bool {
     matches!(verb, Verb::JevStatus(_) | Verb::JevAsk(_))
+}
+
+/// Whether a verb requires a secure worker connection (`wss://` or loopback
+/// `ws://`) that `--allow-insecure-remote` must never bypass.
+pub(crate) fn requires_secure_connection(verb: &Verb) -> bool {
+    matches!(
+        verb,
+        Verb::ProvidersLogin(_) | Verb::ProvidersLoginStatus { .. }
+    )
 }
 
 /// Whether `--json` appears anywhere in the arguments, so a usage error can be
@@ -1721,10 +1773,10 @@ Examples:
     ),
     (
         "providers",
-        r#"Usage: loom-cli providers list|add|remove|discover|set-key
+        r#"Usage: loom-cli providers list|add|remove|discover|set-key|login|login-status
 
-List the configured providers, register an OpenAI-compatible one, or store one
-provider's API key.
+List the configured providers, register an OpenAI-compatible one, store an API
+key, or sign in to GitHub Copilot through the worker's device flow.
 
 Sub-verbs:
   list                        list the providers and their credentials
@@ -1732,6 +1784,8 @@ Sub-verbs:
   remove                      remove an OpenAI-compatible provider and its key
   discover                    replace one provider's models with its /models
   set-key                     store a key read from a variable or a file
+  login                       start the GitHub Copilot device-login flow
+  login-status                poll one GitHub Copilot device login once
 
 Global flags are accepted anywhere; see 'loom-cli --help'.
 
@@ -1741,6 +1795,7 @@ Examples:
     --endpoint https://opencode.ai/inference/go/openai/v1/chat/completions \
     --model qwen3.8-flash
   loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
+  loom-cli providers login --provider github-copilot
   loom-cli providers remove --id opencode-go
 "#,
     ),
@@ -1848,6 +1903,58 @@ Global flags are accepted anywhere; see 'loom-cli --help'.
 Examples:
   loom-cli providers discover --provider opencode-go
   loom-cli providers discover --provider opencode-go --json
+"#,
+    ),
+    (
+        "providers login",
+        r#"Usage: loom-cli providers login --provider github-copilot [--no-wait]
+                                [--timeout <seconds>]
+
+Start the GitHub Copilot device-login flow on the worker, print only the public
+verification URL and user code, and poll until the login is configured, fails,
+or times out. The worker performs the OAuth exchange and stores the credential;
+this client never handles a token.
+
+Requires a secure worker connection (wss:// or loopback ws://);
+--allow-insecure-remote does not override this check. Needs configure_providers.
+
+Exit codes: 0 when configured (or after a successful start with --no-wait),
+1 when the login fails, and 4 (deadline_exceeded) when polling times out.
+
+Flags:
+  --provider <id>             provider to sign in to: github-copilot (required)
+  --no-wait                   print the public code and login_id without polling
+  --timeout <seconds>         bound the poll (defaults to expires_in)
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli providers login --provider github-copilot
+  loom-cli providers login --provider github-copilot --no-wait --json
+  loom-cli providers login --provider github-copilot --timeout 120
+"#,
+    ),
+    (
+        "providers login-status",
+        r#"Usage: loom-cli providers login-status --login-id <id>
+
+Poll the status of an in-flight GitHub Copilot device login once. Text prints
+only the status word (pending, configured, or failed); --json reports
+{login_id, status, message?}. Never prints a token.
+
+Requires a secure worker connection (wss:// or loopback ws://);
+--allow-insecure-remote does not override this check. Needs configure_providers.
+
+Exit codes: 0 for configured, 4 for pending, 1 for failed.
+
+Flags:
+  --login-id <id>             the login id returned by 'providers login' (required)
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli providers login-status --login-id <login-id>
+  loom-cli providers login-status --login-id <login-id> --json
 "#,
     ),
     (
@@ -2604,7 +2711,8 @@ fn arity(name: &str) -> Option<bool> {
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
         "--window" | "--force-discard" | "--sub-agent" => true,
         "--cache-root" => true,
-        "--provider" | "--from-env" | "--key-file" | "--key" | "--api-key" => true,
+        "--provider" | "--from-env" | "--key-file" | "--key" | "--api-key" | "--login-id" => true,
+        "--no-wait" => false,
         "--id" | "--kind" | "--endpoint" | "--default-model" => true,
         "--expected-parent-revision" | "--project" => true,
         "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" | "--tree" => false,
@@ -2615,6 +2723,32 @@ fn arity(name: &str) -> Option<bool> {
         "--apply" => false,
         _ => return None,
     })
+}
+
+/// Whether any token before `--` is a help flag, not the value of another
+/// flag. This keeps `run --task -h` from printing help instead of running.
+fn has_help_flag(arguments: &[String]) -> bool {
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--" {
+            break;
+        }
+        if argument == "--help" || argument == "-h" {
+            return true;
+        }
+        if argument.starts_with('-') {
+            let (name, inline) = match argument.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (argument.as_str(), false),
+            };
+            if arity(name) == Some(true) && !inline {
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 struct Flag {
@@ -2672,11 +2806,9 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
     // would otherwise be rejected, so asking for help always explains the
     // surface instead of failing on one token. A line that names a verb gets
     // that verb's own page; one that names none, or names an unknown verb,
-    // gets the global manual.
-    if arguments
-        .iter()
-        .any(|argument| argument == "--help" || argument == "-h")
-    {
+    // gets the global manual. Only a help flag, never a help-shaped value of
+    // another flag, wins.
+    if has_help_flag(arguments) {
         return Ok(Parsed::Help(help_text(arguments)));
     }
     let (flags, positionals) = split(arguments)?;
@@ -2983,8 +3115,19 @@ fn split(arguments: &[String]) -> Result<(Vec<Flag>, Vec<String>), String> {
     let mut flags = Vec::new();
     let mut positionals = Vec::new();
     let mut index = 0;
+    let mut options_ended = false;
     while index < arguments.len() {
         let argument = &arguments[index];
+        if options_ended {
+            positionals.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        if argument == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
         index += 1;
         if !argument.starts_with('-') {
             positionals.push(argument.clone());
@@ -3142,11 +3285,14 @@ fn parse_cache(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
 /// The `providers` sub-verbs. `list` takes no flags. `set-key` takes the
 /// provider id and exactly one of `--from-env` or `--key-file`. `add`,
 /// `remove`, and `discover` manage an operator-supplied OpenAI-compatible
-/// provider and its model catalog.
+/// provider and its model catalog. `login` and `login-status` drive the
+/// worker-side GitHub Copilot device flow.
 fn parse_providers(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     let Some(sub_verb) = rest.first() else {
         return Err(
-            "providers requires 'list', 'add', 'remove', 'discover', or 'set-key'".to_owned(),
+            "providers requires 'list', 'add', 'remove', 'discover', 'set-key', 'login', or \
+             'login-status'"
+                .to_owned(),
         );
     };
     if rest.len() > 1 {
@@ -3193,10 +3339,53 @@ fn parse_providers(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String>
             let provider = provider_id(&flags.required("--provider")?)?;
             Ok(Verb::ProvidersDiscover { provider })
         }
+        "login" => parse_providers_login(flags),
+        "login-status" => {
+            let raw = flags.required("--login-id")?;
+            let login_id = raw.trim();
+            if login_id.is_empty() {
+                return Err("--login-id must not be empty".to_owned());
+            }
+            Ok(Verb::ProvidersLoginStatus {
+                login_id: login_id.to_owned(),
+            })
+        }
         other => Err(format!(
-            "unknown providers sub-verb '{other}'; use list, add, remove, discover, or set-key"
+            "unknown providers sub-verb '{other}'; use list, add, remove, discover, set-key, \
+             login, or login-status"
         )),
     }
+}
+
+/// `providers login`: start the worker's GitHub Copilot device-login flow.
+fn parse_providers_login(flags: &mut FlagSet) -> Result<Verb, String> {
+    let provider = provider_id(&flags.required("--provider")?)?;
+    if provider != "github-copilot" {
+        return Err(format!(
+            "providers login supports --provider github-copilot, got '{provider}'"
+        ));
+    }
+    let no_wait = flags.flag("--no-wait");
+    let timeout_secs = match flags.value("--timeout") {
+        None => None,
+        Some(value) => {
+            let seconds = value
+                .parse::<u64>()
+                .map_err(|_| format!("--timeout must be a second count, got '{value}'"))?;
+            if seconds == 0 {
+                return Err("--timeout must be greater than zero".to_owned());
+            }
+            if no_wait {
+                return Err("--timeout does not apply with --no-wait".to_owned());
+            }
+            Some(seconds)
+        }
+    };
+    Ok(Verb::ProvidersLogin(ProviderLoginArgs {
+        provider,
+        no_wait,
+        timeout_secs,
+    }))
 }
 
 /// `providers add`: an OpenAI-compatible provider the operator supplies.
@@ -3996,14 +4185,14 @@ fn no_positionals(verb: &str, rest: &[String]) -> Result<(), String> {
 /// so the URL a cursor file is scoped to is the one that was connected to. An
 /// empty or whitespace-only environment value is treated as unset, so it never
 /// produces an unusable link.
-pub(crate) fn resolve_connect(flag: Option<String>, environment: Option<String>) -> String {
+pub fn resolve_connect(flag: Option<String>, environment: Option<String>) -> String {
     flag.or_else(|| environment.filter(|url| !url.trim().is_empty()))
         .unwrap_or_else(|| DEFAULT_CONNECT_URL.to_owned())
 }
 
 /// Where a command reads its bearer token.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TokenFile {
+pub struct TokenFile {
     pub path: PathBuf,
     /// The worker URL the path was derived from, or `None` when the caller named
     /// the file. A read error names it, so a missing default says which URL it
@@ -4026,7 +4215,7 @@ pub(crate) struct TokenFile {
 ///
 /// A blank environment value is treated as unset, like `LOOM_URL`, so an empty
 /// variable falls through to the derived path instead of naming no file.
-pub(crate) fn resolve_token_file(
+pub fn resolve_token_file(
     flag: Option<PathBuf>,
     environment: Option<PathBuf>,
     home: Option<&Path>,

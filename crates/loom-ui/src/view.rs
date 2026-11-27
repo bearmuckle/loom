@@ -13,10 +13,10 @@ use gpui_kit::base::{Disableable, Selectable, TextSelectionLayer};
 use gpui_kit::component::bubble::{Bubble, BubbleContent, BubbleVariant};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{
-    Input as KitInput, InputEvent, InputState, Textarea, TextareaState,
+    Input as KitInput, InputContentType, InputEvent, InputState, Textarea, TextareaState,
 };
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
-use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 // Only the browser startup and reconnect card spins, and that card is
 // compiled for the browser and for its tests.
 #[cfg(any(target_family = "wasm", test))]
@@ -35,9 +35,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Animation, AnimationExt, App, AsyncApp, ClickEvent, ClipboardItem, Context, Element, Entity,
-    FocusHandle, Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, Rgba,
-    StyledText, Subscription, WeakEntity, Window, WindowAppearance, WindowControlArea, div,
-    prelude::*, px,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, Rgba, Role,
+    ScrollHandle, StyledText, Subscription, WeakEntity, Window, WindowAppearance,
+    WindowControlArea, div, prelude::*, px,
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
@@ -836,8 +836,15 @@ pub(crate) struct LoomView {
     next_worker_node_id: u64,
     worker_node_polls_scheduled: BTreeSet<u64>,
     workspace_config: WorkspaceConfig,
+    /// Scroll state for the Settings overlay body so clipped sections stay
+    /// reachable with a visible scrollbar and newly added workers scroll into view.
+    settings_scroll_handle: ScrollHandle,
     node_input_initial: String,
+    node_token_initial: String,
     node_input_state: Option<Entity<InputState>>,
+    node_token_input_state: Option<Entity<InputState>>,
+    /// Inline validation error for the Settings -> Workers connect form.
+    worker_connect_error: Option<String>,
     pub(crate) run_poll_scheduled: bool,
     pub(crate) replaying_events: bool,
     #[cfg(target_family = "wasm")]
@@ -1602,6 +1609,14 @@ pub(crate) struct ProviderAddForm {
 /// A small uppercase section heading inside a settings pane.
 fn settings_section_heading(label: &str) -> impl IntoElement {
     div()
+        .id(format!(
+            "settings-section-heading-{}",
+            label.to_ascii_lowercase().replace(' ', "-")
+        ))
+        .test_support()
+        .role(Role::Heading)
+        .aria_level(2)
+        .aria_label(label.to_owned())
         .text_xs()
         .text_color(rgb(0x93c5fd))
         .child(label.to_owned())
@@ -1790,6 +1805,10 @@ fn settings_nav(
     cx: &mut Context<LoomView>,
 ) -> impl IntoElement {
     div()
+        .id("settings-nav")
+        .test_support()
+        .role(Role::TabList)
+        .aria_label("Settings sections")
         .flex_shrink_0()
         .when(phone, |element| {
             element
@@ -1821,6 +1840,9 @@ fn settings_nav(
                     div()
                         .id(("settings-section", index))
                         .test_support()
+                        .role(Role::Tab)
+                        .aria_label(label)
+                        .aria_selected(selected)
                         .flex_shrink_0()
                         .px_3()
                         .py_2()
@@ -2278,8 +2300,12 @@ impl LoomView {
             worker_nodes: Vec::new(),
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config: WorkspaceConfig::default(),
+            settings_scroll_handle: ScrollHandle::new(),
             node_input_initial: String::new(),
+            node_token_initial: String::new(),
             node_input_state: None,
+            node_token_input_state: None,
+            worker_connect_error: None,
             run_poll_scheduled: false,
             replaying_events: false,
             browser_startup_error: None,

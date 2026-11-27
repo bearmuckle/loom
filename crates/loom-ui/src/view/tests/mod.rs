@@ -52,6 +52,7 @@ mod session_load_tests;
 mod session_name_tests;
 mod session_reference_tests;
 mod session_run_action_tests;
+mod settings_workers_tests;
 mod sidebar_navigation_tests;
 mod startup_tests;
 mod state_toggle_tests;
