@@ -452,7 +452,7 @@ fn a_rebuild_ends_at_the_durable_cursor_on_both_paths(cx: &mut TestAppContext) {
         // session's own creation event and applying it replaces the active
         // session snapshot with the journaled one.
         view.active_session.name = "stale".to_owned();
-        view.collect_events_since(None, Some(durable_cursor), None)
+        view.collect_events_since(None, Some(durable_cursor), None, None)
             .unwrap();
         assert_eq!(view.after_sequence, Some(durable_cursor));
         assert_eq!(view.active_session.name, "Cursor floor session");

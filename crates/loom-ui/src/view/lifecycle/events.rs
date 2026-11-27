@@ -6,6 +6,7 @@ impl LoomView {
         &mut self,
         mut after_sequence: Option<EventSequence>,
         mut durable_latest_sequence: Option<EventSequence>,
+        mut durable_session_state: Option<AgentSessionState>,
         mut fallback: Option<AgentRunSnapshotProjection>,
     ) -> Result<(), LoomError> {
         let session_id = self.active_session.id;
@@ -32,6 +33,7 @@ impl LoomView {
                         events,
                         Self::rebuild_cursor_floor(after_sequence, durable_latest_sequence),
                         durable_latest_sequence,
+                        durable_session_state,
                         fallback,
                     );
                     return Ok(());
@@ -45,6 +47,7 @@ impl LoomView {
                 }) if resync_attempt == 0 => {
                     self.event_stream_epoch = stream_epoch;
                     self.active_session = session;
+                    self.session_state = self.active_session.state;
                     let refreshed =
                         self.connection
                             .request(RequestEnvelope::new(ClientRequest::Session(
@@ -59,6 +62,7 @@ impl LoomView {
                     {
                         after_sequence = Some(initial.cursor);
                         durable_latest_sequence = Some(initial.projection.latest_sequence);
+                        durable_session_state = Some(initial.projection.session.state);
                         fallback = initial.projection.active_run;
                         self.active_session = initial.projection.session;
                         self.session_state = self.active_session.state;
@@ -78,6 +82,7 @@ impl LoomView {
                         events,
                         latest_sequence,
                         durable_latest_sequence,
+                        durable_session_state,
                         fallback,
                         Some(snapshot_state),
                     );
@@ -98,6 +103,7 @@ impl LoomView {
                         events,
                         latest_sequence,
                         durable_latest_sequence,
+                        durable_session_state,
                         fallback,
                         Some(snapshot_state),
                     );
@@ -121,7 +127,7 @@ impl LoomView {
         // snapshot's head afterwards instead of being adopted before them.
         // Anything older than the window is recovered by the durable rebuild
         // this snapshot triggered.
-        self.apply_event_snapshot_with_durable(events, latest_sequence, None, fallback, None);
+        self.apply_event_snapshot_with_durable(events, latest_sequence, None, None, fallback, None);
     }
 
     pub(crate) fn apply_event_snapshot_with_durable(
@@ -129,6 +135,7 @@ impl LoomView {
         events: Vec<loom_protocol::ServerEventEnvelope>,
         latest_sequence: EventSequence,
         durable_sequence: Option<EventSequence>,
+        durable_session_state: Option<AgentSessionState>,
         fallback: Option<AgentRunSnapshotProjection>,
         snapshot_session_state: Option<AgentSessionState>,
     ) {
@@ -136,18 +143,20 @@ impl LoomView {
             events,
             Some(latest_sequence),
             durable_sequence,
+            durable_session_state,
             fallback,
         );
         // `SessionEventsSnapshot.session.state` is captured atomically at
         // `latest_sequence` (the head of `events`). Whenever the snapshot is
         // strictly newer than the durable baseline (or there was no durable
-        // baseline, or the session is archived at head), reconcile with the
-        // snapshot's session state so a transition that aged out of the tail
-        // window is not lost even when newer non-state events were replayed.
+        // baseline, or the session is in a non-run state such as Idle, Queued,
+        // or Archived at head), reconcile with the snapshot's session state so
+        // a transition that aged out of the tail window is not lost even when
+        // newer non-state events were replayed.
         if let Some(state) = snapshot_session_state
             && durable_sequence.is_none_or(|durable| {
                 latest_sequence > durable
-                    || (latest_sequence == durable && state == AgentSessionState::Archived)
+                    || (latest_sequence == durable && run_state_for_session(state).is_none())
             })
             && self.after_sequence.is_none_or(|seq| seq <= latest_sequence)
             && self.session_state != state
@@ -189,22 +198,30 @@ impl LoomView {
     /// session load and the poll-driven snapshot rebuild all call it, so the
     /// reset order, the cursor floor and the fallback order cannot drift apart
     /// between the synchronous and asynchronous paths.
+    #[cfg(test)]
     pub(crate) fn rebuild_projection_from_events(
         &mut self,
         events: Vec<loom_protocol::ServerEventEnvelope>,
         floor: Option<EventSequence>,
         fallback: Option<AgentRunSnapshotProjection>,
     ) {
-        self.rebuild_projection_from_events_after(events, floor, None, fallback);
+        self.rebuild_projection_from_events_after(events, floor, None, None, fallback);
     }
 
     /// Rebuilds from a durable run projection at `durable_sequence` and replays
     /// only events strictly newer than `durable_sequence` (when known).
+    ///
+    /// When `durable_session_state` is a non-run session state (`Idle`,
+    /// `Queued`, `Archived`), it is re-applied right after adopting the
+    /// historical fallback run so restoring or queueing a session with a prior
+    /// persisted run does not clobber the session state before newer events
+    /// replay.
     pub(crate) fn rebuild_projection_from_events_after(
         &mut self,
         events: Vec<loom_protocol::ServerEventEnvelope>,
         floor: Option<EventSequence>,
         durable_sequence: Option<EventSequence>,
+        durable_session_state: Option<AgentSessionState>,
         fallback: Option<AgentRunSnapshotProjection>,
     ) -> usize {
         // The projection is empty again, so apply the durable run baseline at
@@ -215,6 +232,11 @@ impl LoomView {
         self.reset_projection();
         if let Some(projection) = fallback {
             self.apply_run_projection(projection);
+            if let Some(state) = durable_session_state
+                && run_state_for_session(state).is_none()
+            {
+                self.sync_session_state(state);
+            }
             self.after_sequence = durable_sequence;
         }
         self.replaying_events = true;
@@ -697,15 +719,17 @@ impl LoomView {
                         .insert(self.active_session.id, model.clone());
                 }
             }
-            AgentEvent::PlanProposed { plan, .. } => {
-                let steps = plan
-                    .steps
-                    .iter()
-                    .map(|step| step.description.clone())
-                    .collect::<Vec<_>>();
-                self.plan = Some(PlanState::new(steps));
-                self.plan_collapsed = false;
-                self.review.mark_plan_unread();
+            AgentEvent::PlanProposed { run_id, plan } => {
+                if self.active_run_id.is_none_or(|id| id == *run_id) {
+                    let steps = plan
+                        .steps
+                        .iter()
+                        .map(|step| step.description.clone())
+                        .collect::<Vec<_>>();
+                    self.plan = Some(PlanState::new(steps));
+                    self.plan_collapsed = false;
+                    self.review.mark_plan_unread();
+                }
             }
             AgentEvent::UserMessage {
                 run_id,
@@ -715,7 +739,9 @@ impl LoomView {
                 ..
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
-                self.pending_input = None;
+                if self.active_run_id.is_none_or(|id| id == *run_id) {
+                    self.pending_input = None;
+                }
                 if self
                     .optimistic_messages
                     .first()
@@ -732,14 +758,18 @@ impl LoomView {
             AgentEvent::ReasoningDelta { text, .. } => {
                 push_assistant_reasoning(&mut self.timeline, text);
             }
-            AgentEvent::StepStarted { index, .. } => {
-                if let Some(plan) = self.plan.as_mut() {
+            AgentEvent::StepStarted { run_id, index, .. } => {
+                if self.active_run_id.is_none_or(|id| id == *run_id)
+                    && let Some(plan) = self.plan.as_mut()
+                {
                     plan.active = Some(*index);
                     self.review.mark_plan_unread();
                 }
             }
-            AgentEvent::StepCompleted { index, .. } => {
-                if let Some(plan) = self.plan.as_mut() {
+            AgentEvent::StepCompleted { run_id, index, .. } => {
+                if self.active_run_id.is_none_or(|id| id == *run_id)
+                    && let Some(plan) = self.plan.as_mut()
+                {
                     plan.completed.insert(*index);
                     if plan.active == Some(*index) {
                         plan.active = None;
@@ -747,11 +777,13 @@ impl LoomView {
                     self.review.mark_plan_unread();
                 }
             }
-            AgentEvent::ContextInspected { inspection, .. } => {
-                if inspection.compacted {
-                    self.record_status(format!("Context compacted into lossy excerpts (approximately {} tokens removed). Full history is retained.", inspection.omitted_tokens));
+            AgentEvent::ContextInspected { run_id, inspection } => {
+                if self.active_run_id.is_none_or(|id| id == *run_id) {
+                    if inspection.compacted {
+                        self.record_status(format!("Context compacted into lossy excerpts (approximately {} tokens removed). Full history is retained.", inspection.omitted_tokens));
+                    }
+                    self.context_inspection = Some(inspection.clone());
                 }
-                self.context_inspection = Some(inspection.clone());
             }
             AgentEvent::ProviderError { error, .. } | AgentEvent::ContextError { error, .. } => {
                 self.timeline.push(TimelineItem::System(SystemNote {
@@ -783,7 +815,9 @@ impl LoomView {
                 ..
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
-                self.pending_approval = Some(call.clone());
+                if self.active_run_id.is_none_or(|id| id == *run_id) {
+                    self.pending_approval = Some(call.clone());
+                }
                 self.capture_session_reference(call);
                 upsert_tool_part(
                     &mut self.timeline,
@@ -809,8 +843,10 @@ impl LoomView {
                 ..
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
-                self.pending_approval = None;
-                self.approval_request_in_flight = false;
+                if self.active_run_id.is_none_or(|id| id == *run_id) {
+                    self.pending_approval = None;
+                    self.approval_request_in_flight = false;
+                }
                 let status = if *decision == loom_protocol::ApprovalDecision::Approved {
                     ToolPartStatus::Running
                 } else {
@@ -905,20 +941,26 @@ impl LoomView {
                 // it, so the event only marks the run as waiting on the user.
                 // Nothing is added to the transcript here, or the same question
                 // would be presented twice.
-                self.pending_input = Some(prompt.clone());
+                if self.active_run_id.is_none_or(|id| id == *run_id) {
+                    self.pending_input = Some(prompt.clone());
+                }
             }
-            AgentEvent::RunUsage { usage, .. } => {
-                let run = self
-                    .review
-                    .usage
-                    .run
-                    .get_or_insert_with(UsageSnapshot::default);
-                run.input_tokens = usage.input_tokens;
-                run.output_tokens = usage.output_tokens;
-                run.cached_input_tokens = usage.cached_input_tokens;
+            AgentEvent::RunUsage { run_id, usage } => {
+                if self.active_run_id.is_none_or(|id| id == *run_id) {
+                    let run = self
+                        .review
+                        .usage
+                        .run
+                        .get_or_insert_with(UsageSnapshot::default);
+                    run.input_tokens = usage.input_tokens;
+                    run.output_tokens = usage.output_tokens;
+                    run.cached_input_tokens = usage.cached_input_tokens;
+                }
             }
-            AgentEvent::RunUsageUpdated { usage, .. } => {
-                self.review.usage.run = Some(usage.clone());
+            AgentEvent::RunUsageUpdated { run_id, usage } => {
+                if self.active_run_id.is_none_or(|id| id == *run_id) {
+                    self.review.usage.run = Some(usage.clone());
+                }
             }
             AgentEvent::RunLimitReached { status, .. } => {
                 self.record_status(format!("Limit reached: {:?}", status.exceeded));
@@ -932,16 +974,24 @@ impl LoomView {
             AgentEvent::RunStateChanged { run_id, state } => {
                 if self.active_run_id.is_none_or(|id| id == *run_id) {
                     self.set_run_state(*state);
-                }
-                if run_state_is_terminal(*state) {
-                    finish_assistant_turn(&mut self.timeline);
+                    if run_state_is_terminal(*state) {
+                        finish_assistant_turn(&mut self.timeline);
+                    }
                 }
             }
             AgentEvent::RunCompleted { snapshot } => {
-                self.adopt_active_run(snapshot.clone());
-                // The run is over, so stop the streaming cursor even when no
-                // completion summary is rendered.
-                finish_assistant_turn(&mut self.timeline);
+                let stale_other_run = self.active_run.as_ref().is_some_and(|existing| {
+                    existing.id != snapshot.id
+                        && (existing.started_at > snapshot.started_at
+                            || (existing.started_at == snapshot.started_at
+                                && !run_state_is_terminal(existing.state)))
+                });
+                if !stale_other_run {
+                    self.adopt_active_run(snapshot.clone());
+                    // The run is over, so stop the streaming cursor even when no
+                    // completion summary is rendered.
+                    finish_assistant_turn(&mut self.timeline);
+                }
                 if let Some(summary) = &snapshot.summary
                     && !is_redundant_completion_summary(summary)
                     && !summary.trim().is_empty()
@@ -1119,6 +1169,16 @@ impl LoomView {
                 self.run_state = None;
                 self.pending_approval = None;
                 self.pending_input = None;
+                self.approval_request_in_flight = false;
+                if matches!(state, AgentSessionState::Archived | AgentSessionState::Idle)
+                    && let Some(run) = self
+                        .active_run
+                        .as_mut()
+                        .filter(|run| self.active_run_id.is_none_or(|id| run.id == id))
+                    && !run_state_is_terminal(run.state)
+                {
+                    run.state = AgentRunState::Cancelled;
+                }
             }
         }
         self.update_session_list();

@@ -541,6 +541,7 @@ impl LoomView {
         let call_id = part.id;
         let parent_for_toggle = parent.clone();
         let awaiting = part.status == ToolPartStatus::AwaitingApproval
+            && self.session_run_presentation().has_pending_approval
             && self
                 .pending_approval
                 .as_ref()

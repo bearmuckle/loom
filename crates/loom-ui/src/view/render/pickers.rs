@@ -52,11 +52,6 @@ impl LoomView {
         }
         if let Some(state) = &self.model_select {
             let placeholder = self.model_picker_placeholder();
-            let displayed = state
-                .read(cx)
-                .selected_value()
-                .cloned()
-                .unwrap_or_else(|| placeholder.clone());
             picker = picker.child(
                 div()
                     .flex()
@@ -82,7 +77,7 @@ impl LoomView {
                             .menu_width(px(320.))
                             .small()
                             .appearance(false)
-                            .accessibility_label(format!("Model for this session: {displayed}"))
+                            .accessibility_label("Model for this session")
                             .placeholder(placeholder)
                             .search_placeholder("Search models"),
                     ),

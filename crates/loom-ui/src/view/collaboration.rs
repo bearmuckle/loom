@@ -367,24 +367,37 @@ impl LoomView {
         );
     }
 
+    /// Resolves the composer route against the single derived run-state
+    /// presentation so archived/restored sessions never route follow-up text
+    /// against stale pre-archive run state.
+    pub(crate) fn composer_route_for(&self, text: &str) -> ComposerRoute {
+        let permissions = self.session_permissions();
+        let addressing = addressing_for(text, &self.collaboration.roster);
+        let presentation = self.session_run_presentation();
+        let projected_run = presentation.run_state.and_then(|run_state| {
+            self.matched_active_run().cloned().map(|mut run| {
+                run.state = run_state;
+                run
+            })
+        });
+        let revision = projected_run
+            .as_ref()
+            .and_then(|run| self.collaboration.revision_for(run));
+        route_composer(
+            permissions,
+            addressing.to_people,
+            projected_run.as_ref(),
+            presentation.has_pending_input,
+            revision,
+        )
+    }
+
     /// Sends composer text along the route its leading mention, role, and run
     /// state select. Returns `false` when nothing was sent, so the caller keeps
     /// the draft.
     pub(crate) fn send_composer_text(&mut self, text: String, cx: &mut Context<Self>) -> bool {
-        let permissions = self.session_permissions();
         let addressing = addressing_for(&text, &self.collaboration.roster);
-        let run = self
-            .active_run
-            .as_ref()
-            .filter(|run| Some(run.id) == self.active_run_id);
-        let revision = run.and_then(|run| self.collaboration.revision_for(run));
-        let route = route_composer(
-            permissions,
-            addressing.to_people,
-            run,
-            self.pending_input.is_some(),
-            revision,
-        );
+        let route = self.composer_route_for(&text);
         // The mention itself is not part of an agent direction: only the text
         // after `@agent` is sent, while a people mention stays in the stored
         // peer message because it addresses it.

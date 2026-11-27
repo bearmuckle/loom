@@ -131,6 +131,9 @@ impl LoomView {
             fallback_projection
                 .as_ref()
                 .map(|projection| projection.latest_sequence),
+            fallback_projection
+                .as_ref()
+                .map(|projection| projection.session.state),
             fallback_projection.and_then(|projection| projection.active_run),
         ) {
             self.record_backend_error("load session events", error);
@@ -775,6 +778,9 @@ impl LoomView {
         let fallback_latest_sequence = fallback_projection
             .as_ref()
             .map(|projection| projection.latest_sequence);
+        let fallback_session_state = fallback_projection
+            .as_ref()
+            .map(|projection| projection.session.state);
         let fallback_message_count = fallback_projection
             .as_ref()
             .and_then(|projection| projection.active_run.as_ref())
@@ -793,6 +799,7 @@ impl LoomView {
                     events,
                     Self::rebuild_cursor_floor(request_cursor, fallback_latest_sequence),
                     fallback_latest_sequence,
+                    fallback_session_state,
                     fallback_run,
                 );
             }
@@ -811,12 +818,19 @@ impl LoomView {
                     events,
                     latest_sequence,
                     fallback_latest_sequence,
+                    fallback_session_state,
                     fallback_run,
                     Some(snapshot_state),
                 );
             }
             Err(error) => {
-                self.rebuild_projection_from_events(Vec::new(), None, fallback_run);
+                self.rebuild_projection_from_events_after(
+                    Vec::new(),
+                    None,
+                    None,
+                    fallback_session_state,
+                    fallback_run,
+                );
                 self.record_backend_error("load session events", error);
             }
             Ok(response) => {
