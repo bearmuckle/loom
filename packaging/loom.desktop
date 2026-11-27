@@ -3,12 +3,9 @@
 # the executable it is given and that `Icon` matches the icon file, and
 # cargo-deb installs the same three values from `Cargo.toml`.
 #
-# NOTE: `StartupWMClass` has not been confirmed against a real desktop session.
-# It must be checked with a running client (`xprop WM_CLASS`, or
-# `gdbus call --session -d org.gnome.Shell -o /org/gnome/Shell -m
-# org.gnome.Shell.Eval 'global.get_window_actors().map(a => a.meta_window.get_wm_class())'`)
-# and corrected here if gpui reports a different class, otherwise taskbars and
-# docks may show a duplicate or generic launcher entry.
+# `StartupWMClass=loom-ui` is enforced by `NATIVE_APP_ID` in
+# `crates/loom-ui/src/main.rs` (covered by unit test and confirmed on Hyprland:
+# `class=loom-ui`, `initialClass=loom-ui`).
 Type=Application
 Name=Loom
 GenericName=Coding Agent Workspace

@@ -774,6 +774,7 @@ impl Render for LoomView {
                             )
                             .when(self.has_header_archive(), |actions| {
                                 let archive_view = view.clone();
+                                let project_session_id = self.header_project_session_id();
                                 let project_name = self.active_session.name.clone();
                                 let danger_ghost = ButtonCustomVariant::new(cx)
                                     .foreground(cx.theme().danger)
@@ -790,56 +791,56 @@ impl Render for LoomView {
                                             .child(Separator::vertical().w(px(1.)).h(px(16.))),
                                     )
                                     .child(
-                                        Popover::new("archive-project-popover")
-                                            .anchor(Anchor::TopRight)
-                                            .offset(px(4.))
-                                            .trigger(
-                                                header_icon_action(
-                                                    Button::new("archive-project")
-                                                        .icon(Icon::new(AssetIconName::Archive))
-                                                        .custom(danger_ghost),
-                                                    layout,
-                                                )
-                                                .accessibility_label("Archive project")
-                                                .tooltip("Archive project"),
+                                        Popover::new(format!(
+                                            "archive-project-popover:{project_session_id}"
+                                        ))
+                                        .anchor(Anchor::TopRight)
+                                        .offset(px(4.))
+                                        .trigger(
+                                            header_icon_action(
+                                                Button::new("archive-project")
+                                                    .icon(Icon::new(AssetIconName::Archive))
+                                                    .custom(danger_ghost),
+                                                layout,
                                             )
-                                            .content(move |_, _, cx| {
-                                                let popover = cx.entity();
-                                                let cancel_popover = popover.clone();
-                                                let confirm_popover = popover.clone();
-                                                let confirm_view = archive_view.clone();
-                                                div()
-                                                    .id("archive-project-confirm-popover")
-                                                    .test_support()
-                                                    .w(px(260.))
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap_2()
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(rgb(0xf3f4f6))
-                                                            .child("Archive project?"),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgb(0x8f98a6))
-                                                            .child(format!(
-                                                                "Moves {project_name} to Archived sessions. You can restore it later."
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .mt_1()
-                                                            .flex()
-                                                            .justify_end()
-                                                            .gap_2()
-                                                            .child(
-                                                                Button::new(
-                                                                    "cancel-archive-project",
-                                                                )
+                                            .accessibility_label("Archive project")
+                                            .tooltip("Archive project"),
+                                        )
+                                        .content(move |_, _, cx| {
+                                            let popover = cx.entity();
+                                            let cancel_popover = popover.clone();
+                                            let confirm_popover = popover.clone();
+                                            let confirm_view = archive_view.clone();
+                                            div()
+                                                .id("archive-project-confirm-popover")
+                                                .test_support()
+                                                .w(px(260.))
+                                                .flex()
+                                                .flex_col()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(rgb(0xf3f4f6))
+                                                        .child("Archive project?"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x8f98a6))
+                                                        .child(format!(
+                                                            "Moves {project_name} to Archived sessions. You can restore it later."
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .mt_1()
+                                                        .flex()
+                                                        .justify_end()
+                                                        .gap_2()
+                                                        .child(
+                                                            Button::new("cancel-archive-project")
                                                                 .label("Cancel")
                                                                 .ghost()
                                                                 .small()
@@ -855,11 +856,9 @@ impl Render for LoomView {
                                                                         );
                                                                     },
                                                                 ),
-                                                            )
-                                                            .child(
-                                                                Button::new(
-                                                                    "confirm-archive-project",
-                                                                )
+                                                        )
+                                                        .child(
+                                                            Button::new("confirm-archive-project")
                                                                 .label("Archive")
                                                                 .danger()
                                                                 .small()
@@ -877,15 +876,16 @@ impl Render for LoomView {
                                                                             cx,
                                                                             |this, cx| {
                                                                                 this.archive_header_project(
+                                                                                    project_session_id,
                                                                                     cx,
                                                                                 );
                                                                             },
                                                                         );
                                                                     },
                                                                 ),
-                                                            ),
-                                                    )
-                                            }),
+                                                        ),
+                                                )
+                                        }),
                                     )
                                     .child(
                                         div()

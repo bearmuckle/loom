@@ -111,8 +111,9 @@ mod header_shortcuts {
                 .expect("the fixture is a project")
                 .root_session_id;
             view.active_session = view.sessions[1].clone();
+            let delegated_id = view.active_session.id;
             assert!(!view.has_header_archive());
-            view.archive_header_project(cx);
+            view.archive_header_project(delegated_id, cx);
             root
         });
         assert!(
@@ -128,7 +129,7 @@ mod header_shortcuts {
                 .cloned()
                 .expect("the root is listed");
             assert!(view.has_header_archive());
-            view.archive_header_project(cx);
+            view.archive_header_project(root, cx);
         });
         let job = requests.try_recv().unwrap();
         assert!(
@@ -228,6 +229,91 @@ mod header_shortcuts {
         assert!(
             archived_root,
             "confirming the popover must archive the project root"
+        );
+    }
+
+    /// Switching the active project while the archive confirmation popover is
+    /// open must not carry the open popover onto the new project or archive the
+    /// wrong project.
+    #[gpui_kit::test]
+    fn switching_active_project_dismisses_archive_popover_without_archiving_new_project(
+        cx: &mut TestAppContext,
+    ) {
+        let (backend, requests) = BackendWorker::deferred_for_test();
+        let (handle, view) = open_view_window(cx, backend);
+        let project_b = view.update(cx, |view, cx| {
+            let mut second = view.active_session.clone();
+            second.id = AgentSessionId::new();
+            second.name = "Second project".to_owned();
+            let node_id = view.default_backend_node_id.clone();
+            view.session_node_ids.insert(second.id, node_id);
+            view.sessions.push(second.clone());
+            cx.notify();
+            second
+        });
+
+        // Open the archive confirmation popover on project A.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            while let Ok(job) = requests.try_recv() {
+                refuse(job);
+            }
+            window.click("archive-project", cx);
+            window.render_frame(cx);
+            assert!(
+                window.find("archive-project-confirm-popover").visible(),
+                "archive popover should open for project A"
+            );
+        })
+        .unwrap();
+
+        // Switch the active project to B while A's popover was open.
+        view.update(cx, |view, cx| {
+            view.active_session = project_b.clone();
+            view.project_snapshot = None;
+            cx.notify();
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("archive-project-confirm-popover").is_none(),
+                "switching to project B must close project A's archive popover"
+            );
+        })
+        .unwrap();
+        while let Ok(job) = requests.try_recv() {
+            assert!(
+                !matches!(
+                    job.request.request,
+                    ClientRequest::Session(SessionRequest::ArchiveAgentSession { .. })
+                ),
+                "switching projects while the popover is open must not archive anything"
+            );
+            refuse(job);
+        }
+
+        // Opening and confirming on project B archives B specifically.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("archive-project", cx);
+            window.render_frame(cx);
+            assert!(window.find("archive-project-confirm-popover").visible());
+            window.click("confirm-archive-project", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut archived_ids = Vec::new();
+        while let Ok(job) = requests.try_recv() {
+            if let ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id }) =
+                job.request.request
+            {
+                archived_ids.push(session_id);
+            }
+            refuse(job);
+        }
+        assert_eq!(
+            archived_ids,
+            vec![project_b.id],
+            "confirming on project B must archive only project B"
         );
     }
 

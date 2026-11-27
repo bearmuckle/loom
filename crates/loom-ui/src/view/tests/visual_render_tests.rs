@@ -586,21 +586,82 @@ fn first_run_worker_setup_paints_cleanly_at_1280x800() {
 
 #[test]
 fn header_toolbars_paint_separated_archive_action_on_active_project() {
-    let empty = capture(|_| {});
-    let project = capture(|view| {
-        view.active_session.name = "Refactor toolbars".to_owned();
-        view.sessions = vec![view.active_session.clone()];
-        let session_id = view.active_session.id;
-        view.session_node_ids
-            .insert(session_id, view.default_backend_node_id.clone());
-    });
+    use loom_core::{
+        AgentSessionId, AgentSessionState, EventSequence, ProjectAgentRecord, ProjectId,
+        ProjectSnapshot, Timestamp,
+    };
+
+    let root_id = AgentSessionId::new();
+    let child_id = AgentSessionId::new();
+    let project_id = ProjectId::from_uuid(*root_id.as_uuid());
+    let timestamp = Timestamp::from_unix_millis(1);
+    let snapshot = ProjectSnapshot {
+        project_id,
+        root_session_id: root_id,
+        parent_project_id: None,
+        agents: vec![
+            ProjectAgentRecord {
+                session_id: root_id,
+                project_id,
+                parent_session_id: None,
+                depth: 1,
+                state: AgentSessionState::Idle,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: timestamp,
+            },
+            ProjectAgentRecord {
+                session_id: child_id,
+                project_id,
+                parent_session_id: Some(root_id),
+                depth: 2,
+                state: AgentSessionState::Idle,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: timestamp,
+            },
+        ],
+        tasks: Vec::new(),
+        worktrees: Vec::new(),
+    };
+
+    // Build two otherwise identical project frames: selecting the root enables
+    // `has_header_archive()` (painting the separated archive button and its
+    // vertical dividers), while selecting a same-named delegated child hides
+    // only the archive button and dividers while keeping the rest of the header
+    // and sidebar row identical.
+    let configure = |select_root: bool| {
+        let snapshot = snapshot.clone();
+        move |view: &mut LoomView| {
+            let mut root = view.active_session.clone();
+            root.id = root_id;
+            root.name = "Refactor toolbars".to_owned();
+            root.created_at = timestamp;
+            root.updated_at = timestamp;
+
+            let mut child = root.clone();
+            child.id = child_id;
+
+            let node_id = view.default_backend_node_id.clone();
+            view.session_node_ids.insert(root.id, node_id.clone());
+            view.session_node_ids.insert(child.id, node_id);
+            view.sessions = vec![root.clone(), child.clone()];
+            view.project_snapshot = Some(snapshot.clone());
+            view.project_tree_snapshots = vec![snapshot];
+            view.active_session = if select_root { root } else { child };
+            assert_eq!(view.has_header_archive(), select_root);
+        }
+    };
+
+    let with_archive = capture(configure(true));
+    let without_archive = capture(configure(false));
     assert!(
-        project.has_aspect_ratio(1280, 800),
+        with_archive.has_aspect_ratio(1280, 800),
         "project view should keep the 1280x800 aspect ratio"
     );
     assert_ne!(
-        project.fingerprint(),
-        empty.fingerprint(),
-        "active project header toolbars must paint distinctly over the empty view"
+        with_archive.fingerprint(),
+        without_archive.fingerprint(),
+        "the separated header archive action and dividers must paint pixels when has_header_archive() is true"
     );
 }
