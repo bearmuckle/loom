@@ -516,6 +516,49 @@ fn insecure_remote_host(url: &str) -> Option<String> {
     Some(host.to_owned())
 }
 
+/// Whether `url` is encrypted (`wss://`) or loopback (`ws://` to `localhost`,
+/// `127.0.0.1`, `[::1]`, or another loopback IP), so secrets and device-login
+/// flows may run against that worker.
+///
+/// Mirrors the UI's `remote_url_is_secure_for_secrets` rule: rejects embedded
+/// userinfo (`@`), empty authorities, non-WebSocket schemes, and plaintext
+/// `ws://` to non-loopback hosts, and ties `wss://` to
+/// [`WEBSOCKET_TLS_SUPPORTED`].
+pub fn remote_url_is_secure_for_secrets(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let is_wss = scheme.eq_ignore_ascii_case("wss");
+    let is_ws = scheme.eq_ignore_ascii_case("ws");
+    if !is_wss && !is_ws {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    if is_wss {
+        return WEBSOCKET_TLS_SUPPORTED;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((host, tail)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if !tail.is_empty() && !tail.starts_with(':') {
+            return false;
+        }
+        host
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 /// Substrings that identify a rustls certificate or handshake failure, which
 /// tokio-tungstenite reports as an opaque I/O error.
 const TLS_FAILURE_MARKERS: [&str; 7] = [
@@ -770,5 +813,28 @@ mod tests {
             assert_eq!(error.code, ErrorCode::PayloadTooLarge);
             server.stop().await.unwrap();
         });
+    }
+
+    #[test]
+    fn remote_url_is_secure_for_secrets_accepts_wss_and_loopback_only() {
+        assert_eq!(
+            remote_url_is_secure_for_secrets("wss://worker.example/ws"),
+            WEBSOCKET_TLS_SUPPORTED
+        );
+        assert!(remote_url_is_secure_for_secrets("ws://localhost:8080/ws"));
+        assert!(remote_url_is_secure_for_secrets("ws://LOCALHOST:8080/ws"));
+        assert!(remote_url_is_secure_for_secrets("ws://127.0.0.1:8765/ws"));
+        assert!(remote_url_is_secure_for_secrets("ws://[::1]:8765/ws"));
+        assert!(!remote_url_is_secure_for_secrets("ws://worker.example/ws"));
+        assert!(!remote_url_is_secure_for_secrets("ws://100.64.0.1:8765/ws"));
+        assert!(!remote_url_is_secure_for_secrets(
+            "ws://user:pass@localhost/ws"
+        ));
+        assert!(!remote_url_is_secure_for_secrets(
+            "wss://user:pass@worker.example/ws"
+        ));
+        assert!(!remote_url_is_secure_for_secrets("wss:///ws"));
+        assert!(!remote_url_is_secure_for_secrets("http://127.0.0.1:8765"));
+        assert!(!remote_url_is_secure_for_secrets("ws://[::1"));
     }
 }

@@ -92,12 +92,18 @@ One tool per first-slice verb:
 | `archive` | `session archive` | yes |
 | `models_list` | `models list` | no |
 | `providers_list` | `providers list` | no |
+| `copilot_login_start` | `providers login` | yes |
+| `copilot_login_status` | `providers login-status` | yes |
 
 Every tool result carries `exit_code` and `ok` in its structured content, with
 the verb's text output in `output`, so the exit meaning is the one
 `loom-cli` documents. Mutating tools are annotated `destructiveHint` and read
 tools `readOnlyHint`, so the MCP host can approve or reject each mutating call;
-authentication never auto-allows `approve`/`deny`/`run`/`send`/`archive`.
+authentication never auto-allows `approve`/`deny`/`run`/`send`/`archive`/
+`copilot_login_start`/`copilot_login_status`. `copilot_login_start` and
+`copilot_login_status` return only the public device-login payload and status
+(never a token) and enforce the same `wss://` or loopback `ws://` rule as
+`loom-cli` (not overridable by `--allow-insecure-remote`).
 
 ## Resources
 
@@ -113,5 +119,6 @@ produces, without any credential.
 ## Read-only mode
 
 `--read-only` exposes only `ls`, `status`, `models_list`, `providers_list`, and
-the log resources. `run`, `send`, `approve`, `deny`, and `archive` are removed
-from the tool list and refused if called anyway.
+the log resources. `run`, `send`, `approve`, `deny`, `archive`,
+`copilot_login_start`, and `copilot_login_status` are removed from the tool
+list and refused if called anyway.

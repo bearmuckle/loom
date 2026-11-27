@@ -10,7 +10,15 @@ use crate::runner;
 /// Tool names that mutate the worker. They are hidden unless the operator
 /// opted in with `--allow-mutating-tools`, and each carries a
 /// `destructiveHint` so an MCP host can still require per-call approval.
-pub const MUTATING_TOOLS: &[&str] = &["run", "send", "approve", "deny", "archive"];
+pub const MUTATING_TOOLS: &[&str] = &[
+    "run",
+    "send",
+    "approve",
+    "deny",
+    "archive",
+    "copilot_login_start",
+    "copilot_login_status",
+];
 const ALL_TOOLS: &[&str] = &[
     "ls",
     "status",
@@ -21,6 +29,8 @@ const ALL_TOOLS: &[&str] = &[
     "archive",
     "models_list",
     "providers_list",
+    "copilot_login_start",
+    "copilot_login_status",
 ];
 
 /// One declared MCP tool.
@@ -222,6 +232,50 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         },
+        ToolSpec {
+            name: "copilot_login_start",
+            description: "Start the GitHub Copilot device-login flow on the worker and optionally \
+                          poll until it finishes; returns only the public verification URL, user \
+                          code, and status, never a token (loom-cli providers login).",
+            mutating: true,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "enum": ["github-copilot"],
+                        "description": "Provider to sign in to (defaults to github-copilot)."
+                    },
+                    "no_wait": {
+                        "type": "boolean",
+                        "description": "Return the public verification URL, user code, and login_id immediately without polling."
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum seconds to poll for completion; omitted uses the worker's expires_in."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "copilot_login_status",
+            description: "Poll one in-flight GitHub Copilot device login once; reports pending, \
+                          configured, or failed and never a token (loom-cli providers login-status).",
+            mutating: true,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "login_id": {
+                        "type": "string",
+                        "description": "Login id returned by copilot_login_start."
+                    }
+                },
+                "required": ["login_id"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -271,6 +325,21 @@ fn optional_bool(
         None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(_) => Err(format!("argument '{key}' must be a boolean")),
+    }
+}
+
+fn optional_positive_u64(
+    arguments: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<u64>, String> {
+    match arguments.get(key) {
+        None => Ok(None),
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(value) if value > 0 => Ok(Some(value)),
+            Some(_) => Err(format!("argument '{key}' must be greater than zero")),
+            None => Err(format!("argument '{key}' must be a positive integer")),
+        },
+        Some(_) => Err(format!("argument '{key}' must be a positive integer")),
     }
 }
 
@@ -527,6 +596,47 @@ pub fn tool_argv(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             let _ = arguments_object(arguments, &[])?;
             argv.extend(["providers".to_owned(), "list".to_owned()]);
         }
+        "copilot_login_start" => {
+            let arguments = arguments_object(arguments, &["provider", "no_wait", "timeout"])?;
+            let provider = optional_string(arguments, "provider")?
+                .unwrap_or_else(|| "github-copilot".to_owned());
+            if provider != "github-copilot" {
+                return Err(format!(
+                    "argument 'provider' must be 'github-copilot', got '{provider}'"
+                ));
+            }
+            let no_wait = optional_bool(arguments, "no_wait")?.unwrap_or(false);
+            let timeout = optional_positive_u64(arguments, "timeout")?;
+            if no_wait && timeout.is_some() {
+                return Err("argument 'timeout' does not apply when 'no_wait' is true".to_owned());
+            }
+            argv.extend([
+                "providers".to_owned(),
+                "login".to_owned(),
+                "--provider".to_owned(),
+                provider,
+            ]);
+            if no_wait {
+                argv.push("--no-wait".to_owned());
+            }
+            if let Some(seconds) = timeout {
+                argv.extend(["--timeout".to_owned(), seconds.to_string()]);
+            }
+        }
+        "copilot_login_status" => {
+            let arguments = arguments_object(arguments, &["login_id"])?;
+            let login_id = required_string(arguments, "login_id")?;
+            let login_id = login_id.trim().to_owned();
+            if login_id.starts_with('-') {
+                return Err(format!("'{login_id}' is not a valid login_id"));
+            }
+            argv.extend([
+                "providers".to_owned(),
+                "login-status".to_owned(),
+                "--login-id".to_owned(),
+                login_id,
+            ]);
+        }
         _ => return Err(format!("unknown tool '{name}'")),
     }
     Ok(argv)
@@ -699,6 +809,35 @@ mod tests {
             tool_argv("providers_list", &json!({})).unwrap(),
             vec!["providers", "list"]
         );
+        assert_eq!(
+            tool_argv(
+                "copilot_login_start",
+                &json!({ "provider": "github-copilot", "no_wait": true })
+            )
+            .unwrap(),
+            vec![
+                "providers",
+                "login",
+                "--provider",
+                "github-copilot",
+                "--no-wait"
+            ]
+        );
+        assert_eq!(
+            tool_argv("copilot_login_start", &json!({ "timeout": 45 })).unwrap(),
+            vec![
+                "providers",
+                "login",
+                "--provider",
+                "github-copilot",
+                "--timeout",
+                "45"
+            ]
+        );
+        assert_eq!(
+            tool_argv("copilot_login_status", &json!({ "login_id": "login-42" })).unwrap(),
+            vec!["providers", "login-status", "--login-id", "login-42"]
+        );
     }
 
     #[test]
@@ -715,6 +854,7 @@ mod tests {
         assert!(tool_argv("send", &json!({ "run": RUN })).is_err());
         assert!(tool_argv("approve", &json!({ "run": RUN })).is_err());
         assert!(tool_argv("archive", &json!({})).is_err());
+        assert!(tool_argv("copilot_login_status", &json!({})).is_err());
         assert!(
             tool_argv(
                 "status",
@@ -748,6 +888,19 @@ mod tests {
         );
         assert!(tool_argv("status", &json!({ "session": "-abc" })).is_err());
         assert!(tool_argv("send", &json!({ "run": "-h", "text": "go" })).is_err());
+        assert!(tool_argv("copilot_login_start", &json!({ "provider": "openai" })).is_err());
+        assert!(
+            tool_argv(
+                "copilot_login_start",
+                &json!({ "no_wait": true, "timeout": 10 })
+            )
+            .is_err()
+        );
+        assert!(tool_argv("copilot_login_start", &json!({ "timeout": 0 })).is_err());
+        assert!(tool_argv("copilot_login_start", &json!({ "timeout": -1 })).is_err());
+        assert!(tool_argv("copilot_login_start", &json!({ "access_token": "x" })).is_err());
+        assert!(tool_argv("copilot_login_status", &json!({ "login_id": "-h" })).is_err());
+        assert!(tool_argv("copilot_login_status", &json!({ "login_id": "   " })).is_err());
     }
 
     #[test]

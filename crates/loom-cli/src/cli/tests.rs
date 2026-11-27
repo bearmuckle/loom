@@ -1852,6 +1852,14 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
             vec![Capability::JsonProtocol, Capability::ConfigureProviders],
         ),
         (
+            vec!["providers", "login", "--provider", "github-copilot"],
+            vec![Capability::JsonProtocol, Capability::ConfigureProviders],
+        ),
+        (
+            vec!["providers", "login-status", "--login-id", "login-1"],
+            vec![Capability::JsonProtocol, Capability::ConfigureProviders],
+        ),
+        (
             vec!["delete", &session],
             vec![
                 Capability::JsonProtocol,
@@ -4857,6 +4865,14 @@ fn a_verb_help_page_prints_its_own_usage_and_examples() {
         (
             owned(&["providers", "set-key", "--help"]),
             "Usage: loom-cli providers set-key",
+        ),
+        (
+            owned(&["providers", "login", "--help"]),
+            "Usage: loom-cli providers login",
+        ),
+        (
+            owned(&["providers", "login-status", "--help"]),
+            "Usage: loom-cli providers login-status",
         ),
         (
             owned(&["models", "list", "--help"]),
@@ -8058,12 +8074,12 @@ fn the_parser_covers_the_operator_verbs() {
     assert_eq!(from_file.provider, "deepseek");
     assert!(matches!(from_file.source, ProviderKeySource::File(_)));
 
+    assert!(parse_error(&["providers"]).contains(
+        "requires 'list', 'add', 'remove', 'discover', 'set-key', 'login', or 'login-status'"
+    ));
     assert!(
-        parse_error(&["providers"])
-            .contains("requires 'list', 'add', 'remove', 'discover', or 'set-key'")
-    );
-    assert!(
-        parse_error(&["providers", "show"]).contains("use list, add, remove, discover, or set-key")
+        parse_error(&["providers", "show"])
+            .contains("use list, add, remove, discover, set-key, login, or login-status")
     );
     assert!(parse_error(&["providers", "list", "extra"]).contains("one sub-verb"));
     assert!(
@@ -12537,6 +12553,8 @@ fn every_nested_command_and_group_has_its_own_help() {
         "providers",
         "providers list",
         "providers set-key",
+        "providers login",
+        "providers login-status",
         "models",
         "models list",
         "session",
@@ -13013,4 +13031,710 @@ fn every_session_input_accepts_a_short_prefix_and_a_typo_is_still_refused() {
     assert!(parse_error(&["get", "not-a-session"]).contains("is not a valid session id"));
     assert!(parse_error(&["get", ""]).contains("is not a valid session id"));
     assert!(parse_error(&["status", "--session", "loom"]).contains("is not a valid session id"));
+}
+
+/// A fake worker client for the GitHub Copilot device-login tests. Never talks
+/// to GitHub; returns clearly fake placeholders (`USER-CODE`,
+/// `https://example.test/device`) and scripted status transitions.
+struct StubCopilotClient {
+    login_id: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+    statuses: std::collections::VecDeque<loom_protocol::GitHubCopilotLoginStatus>,
+    deny_capability: bool,
+    recorded_requests: Vec<ClientRequest>,
+}
+
+impl StubCopilotClient {
+    fn new(statuses: impl IntoIterator<Item = loom_protocol::GitHubCopilotLoginStatus>) -> Self {
+        Self {
+            login_id: "login-fake-1".to_owned(),
+            user_code: "USER-CODE".to_owned(),
+            verification_uri: "https://example.test/device".to_owned(),
+            expires_in: 900,
+            interval: 5,
+            statuses: statuses.into_iter().collect(),
+            deny_capability: false,
+            recorded_requests: Vec::new(),
+        }
+    }
+}
+
+impl Client for StubCopilotClient {
+    fn request<'a>(
+        &'a mut self,
+        envelope: RequestEnvelope,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ResponseEnvelope, loom_core::LoomError>> + 'a>,
+    > {
+        self.recorded_requests.push(envelope.request.clone());
+        let response = match envelope.request {
+            ClientRequest::Control(ControlRequest::Negotiate { capabilities, .. }) => {
+                let granted = if self.deny_capability {
+                    CapabilitySet::new([Capability::JsonProtocol])
+                } else {
+                    capabilities
+                };
+                ResponseEnvelope::success(
+                    envelope.request_id,
+                    ServerResponse::Control(ControlResponse::Negotiated(
+                        loom_protocol::NegotiationResult {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            capabilities: granted,
+                        },
+                    )),
+                )
+            }
+            ClientRequest::Provider(loom_protocol::ProviderRequest::StartGitHubCopilotLogin) => {
+                if self.deny_capability {
+                    ResponseEnvelope::failure(
+                        envelope.request_id,
+                        loom_core::LoomError::new(
+                            loom_core::ErrorCode::CapabilityDenied,
+                            "missing capability configure_providers",
+                            false,
+                        ),
+                    )
+                } else {
+                    ResponseEnvelope::success(
+                        envelope.request_id,
+                        ServerResponse::Provider(
+                            loom_protocol::ProviderResponse::GitHubCopilotLoginStarted {
+                                login_id: self.login_id.clone(),
+                                user_code: self.user_code.clone(),
+                                verification_uri: self.verification_uri.clone(),
+                                expires_in: self.expires_in,
+                                interval: self.interval,
+                            },
+                        ),
+                    )
+                }
+            }
+            ClientRequest::Provider(
+                loom_protocol::ProviderRequest::GetGitHubCopilotLoginStatus { .. },
+            ) => {
+                if self.deny_capability {
+                    ResponseEnvelope::failure(
+                        envelope.request_id,
+                        loom_core::LoomError::new(
+                            loom_core::ErrorCode::CapabilityDenied,
+                            "missing capability configure_providers",
+                            false,
+                        ),
+                    )
+                } else {
+                    let status = self
+                        .statuses
+                        .pop_front()
+                        .unwrap_or(loom_protocol::GitHubCopilotLoginStatus::Pending);
+                    ResponseEnvelope::success(
+                        envelope.request_id,
+                        ServerResponse::Provider(
+                            loom_protocol::ProviderResponse::GitHubCopilotLoginStatus { status },
+                        ),
+                    )
+                }
+            }
+            other => panic!("unexpected request sent by providers login verb: {other:?}"),
+        };
+        Box::pin(async move { Ok(response) })
+    }
+}
+
+fn assert_no_token_fields(output: &str) {
+    for forbidden in [
+        "access_token",
+        "ConfigureGitHubCopilot",
+        "credential_id",
+        "api_key",
+        "gho_",
+        "ghp_",
+    ] {
+        assert!(
+            !output.contains(forbidden),
+            "output must never contain '{forbidden}': {output}"
+        );
+    }
+}
+
+#[test]
+fn providers_login_help_and_parse_surface() {
+    assert!(args::HELP.contains("providers login --provider github-copilot"));
+    assert!(args::HELP.contains("providers login-status --login-id"));
+    assert!(args::HELP.contains("not api-key-configurable"));
+
+    let login_help = args::help_text(&owned(&["providers", "login", "--help"]));
+    assert!(login_help.starts_with("Usage: loom-cli providers login"));
+    assert!(login_help.contains("--no-wait"));
+    assert!(login_help.contains("--timeout"));
+    assert!(login_help.contains("wss:// or loopback ws://"));
+
+    let status_help = args::help_text(&owned(&["providers", "login-status", "--help"]));
+    assert!(status_help.starts_with("Usage: loom-cli providers login-status"));
+    assert!(status_help.contains("--login-id"));
+
+    let parsed = invocation(&[
+        "providers",
+        "login",
+        "--provider",
+        "github-copilot",
+        "--timeout",
+        "30",
+    ]);
+    assert!(matches!(
+        parsed.verb,
+        Verb::ProvidersLogin(args::ProviderLoginArgs {
+            ref provider,
+            no_wait: false,
+            timeout_secs: Some(30),
+        }) if provider == "github-copilot"
+    ));
+
+    let no_wait = invocation(&[
+        "providers",
+        "login",
+        "--provider",
+        "github-copilot",
+        "--no-wait",
+    ]);
+    assert!(matches!(
+        no_wait.verb,
+        Verb::ProvidersLogin(args::ProviderLoginArgs {
+            ref provider,
+            no_wait: true,
+            timeout_secs: None,
+        }) if provider == "github-copilot"
+    ));
+
+    let status = invocation(&["providers", "login-status", "--login-id", "login-fake-1"]);
+    assert!(matches!(
+        status.verb,
+        Verb::ProvidersLoginStatus { ref login_id } if login_id == "login-fake-1"
+    ));
+
+    // Rejected inputs: wrong provider, key/env flags, invalid timeout, conflicting flags.
+    assert!(parse_error(&["providers", "login"]).contains("--provider"));
+    assert!(
+        parse_error(&["providers", "login", "--provider", "openai"]).contains("github-copilot")
+    );
+    assert!(
+        parse_error(&["providers", "login", "--provider", "github-repository"])
+            .contains("github-copilot")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--from-env",
+            "GITHUB_TOKEN",
+        ])
+        .contains("does not apply")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--key-file",
+            "/tmp/fake.key",
+        ])
+        .contains("does not apply")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--key",
+            "fake",
+        ])
+        .contains("must not be passed on the command line")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--timeout",
+            "0",
+        ])
+        .contains("greater than zero")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--no-wait",
+            "--timeout",
+            "10",
+        ])
+        .contains("--no-wait")
+    );
+    assert!(parse_error(&["providers", "login-status"]).contains("--login-id"));
+    assert!(
+        parse_error(&["providers", "login-status", "--login-id", "   "])
+            .contains("must not be empty")
+    );
+}
+
+#[tokio::test]
+async fn providers_login_polls_until_configured_and_never_emits_tokens() {
+    use loom_protocol::GitHubCopilotLoginStatus as Status;
+
+    let mut client = StubCopilotClient::new([Status::Pending, Status::Configured]);
+    client.interval = 1;
+    let text = run_async(
+        &mut client,
+        &["providers", "login", "--provider", "github-copilot"],
+    )
+    .await;
+    assert_eq!(text.code, exit::OK, "{}", text.stderr);
+    assert_eq!(text.stderr, "");
+    assert_eq!(
+        text.stdout,
+        "url https://example.test/device\nuser_code USER-CODE\nstatus configured\n"
+    );
+    assert_no_token_fields(&text.stdout);
+    assert_no_token_fields(&text.stderr);
+
+    let mut json_client = StubCopilotClient::new([Status::Configured]);
+    let json_outcome = run_async(
+        &mut json_client,
+        &[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(json_outcome.code, exit::OK, "{}", json_outcome.stderr);
+    assert_eq!(json_outcome.stderr, "");
+    let envelope = json_envelope(&json_outcome);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["verb"], "providers login");
+    assert_eq!(envelope["data"]["provider"], "github-copilot");
+    assert_eq!(envelope["data"]["login_id"], "login-fake-1");
+    assert_eq!(envelope["data"]["url"], "https://example.test/device");
+    assert_eq!(envelope["data"]["user_code"], "USER-CODE");
+    assert_eq!(envelope["data"]["expires_in"], 900);
+    assert_eq!(envelope["data"]["interval"], 5);
+    assert_eq!(envelope["data"]["status"], "configured");
+    assert_no_token_fields(&json_outcome.stdout);
+}
+
+#[tokio::test]
+async fn providers_login_reports_worker_failure_with_distinct_nonzero_exit() {
+    use loom_protocol::GitHubCopilotLoginStatus as Status;
+
+    let mut client = StubCopilotClient::new([Status::Failed {
+        message: "authorization expired".to_owned(),
+    }]);
+    let text = run_async(
+        &mut client,
+        &["providers", "login", "--provider", "github-copilot"],
+    )
+    .await;
+    assert_ne!(text.code, exit::OK);
+    assert_ne!(text.code, exit::TIMEOUT);
+    assert_eq!(text.code, exit::INTERNAL);
+    assert!(text.stdout.contains("https://example.test/device"));
+    assert!(text.stdout.contains("USER-CODE"));
+    assert!(
+        text.stderr.contains("authorization expired"),
+        "{}",
+        text.stderr
+    );
+    assert_no_token_fields(&text.stdout);
+    assert_no_token_fields(&text.stderr);
+
+    let mut json_client = StubCopilotClient::new([Status::Failed {
+        message: "authorization expired".to_owned(),
+    }]);
+    let json_outcome = run_async(
+        &mut json_client,
+        &[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(json_outcome.code, exit::INTERNAL);
+    let envelope = json_envelope(&json_outcome);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["verb"], "providers login");
+    assert_eq!(envelope["error"]["exit_code"], exit::INTERNAL);
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("authorization expired")
+    );
+    assert_no_token_fields(&json_outcome.stdout);
+}
+
+#[tokio::test]
+async fn providers_login_times_out_with_deadline_exceeded_exit_4() {
+    // Explicit --timeout bounds the poll.
+    let mut client = StubCopilotClient::new([]);
+    client.interval = 1;
+    let outcome = run_async(
+        &mut client,
+        &[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--timeout",
+            "1",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(outcome.code, exit::TIMEOUT);
+    let envelope = json_envelope(&outcome);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "deadline_exceeded");
+    assert_eq!(envelope["error"]["exit_code"], exit::TIMEOUT);
+    assert_eq!(envelope["error"]["retryable"], true);
+    assert_no_token_fields(&outcome.stdout);
+
+    // Omitting --timeout defaults to the start response's expires_in.
+    let mut default_client = StubCopilotClient::new([]);
+    default_client.expires_in = 1;
+    default_client.interval = 1;
+    let default_outcome = run_async(
+        &mut default_client,
+        &["providers", "login", "--provider", "github-copilot"],
+    )
+    .await;
+    assert_eq!(default_outcome.code, exit::TIMEOUT);
+    assert!(
+        default_outcome.stderr.contains("deadline_exceeded"),
+        "{}",
+        default_outcome.stderr
+    );
+    assert_no_token_fields(&default_outcome.stdout);
+    assert_no_token_fields(&default_outcome.stderr);
+}
+
+#[tokio::test]
+async fn providers_login_no_wait_and_login_status_transitions() {
+    use loom_protocol::GitHubCopilotLoginStatus as Status;
+
+    // --no-wait starts and exits 0 without polling status.
+    let mut start_client = StubCopilotClient::new([]);
+    let started_json = run_async(
+        &mut start_client,
+        &[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--no-wait",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(started_json.code, exit::OK, "{}", started_json.stderr);
+    assert_eq!(
+        start_client.recorded_requests.len(),
+        2,
+        "only Negotiate and StartGitHubCopilotLogin should be sent under --no-wait"
+    );
+    let envelope = json_envelope(&started_json);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["verb"], "providers login");
+    assert_eq!(envelope["data"]["provider"], "github-copilot");
+    assert_eq!(envelope["data"]["login_id"], "login-fake-1");
+    assert_eq!(envelope["data"]["url"], "https://example.test/device");
+    assert_eq!(envelope["data"]["user_code"], "USER-CODE");
+    assert_eq!(envelope["data"]["expires_in"], 900);
+    assert_eq!(envelope["data"]["interval"], 5);
+    assert_eq!(envelope["data"]["status"], "pending");
+    assert_no_token_fields(&started_json.stdout);
+
+    let mut text_start_client = StubCopilotClient::new([]);
+    let started_text = run_async(
+        &mut text_start_client,
+        &[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--no-wait",
+        ],
+    )
+    .await;
+    assert_eq!(started_text.code, exit::OK, "{}", started_text.stderr);
+    assert_eq!(
+        started_text.stdout,
+        "url https://example.test/device\nuser_code USER-CODE\nlogin_id login-fake-1\n"
+    );
+    assert_no_token_fields(&started_text.stdout);
+
+    // Poll separately with `providers login-status`: pending -> configured -> failed.
+    let mut poll_client = StubCopilotClient::new([
+        Status::Pending,
+        Status::Pending,
+        Status::Configured,
+        Status::Configured,
+        Status::Failed {
+            message: "denied by user".to_owned(),
+        },
+        Status::Failed {
+            message: "denied by user".to_owned(),
+        },
+    ]);
+
+    let pending_text = run_async(
+        &mut poll_client,
+        &["providers", "login-status", "--login-id", "login-fake-1"],
+    )
+    .await;
+    assert_eq!(pending_text.code, exit::TIMEOUT);
+    assert_eq!(pending_text.stdout, "pending\n");
+    assert_eq!(pending_text.stderr, "");
+
+    let pending_json = run_async(
+        &mut poll_client,
+        &[
+            "providers",
+            "login-status",
+            "--login-id",
+            "login-fake-1",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(pending_json.code, exit::TIMEOUT);
+    let envelope = json_envelope(&pending_json);
+    assert_eq!(envelope["verb"], "providers login-status");
+    assert_eq!(envelope["data"]["login_id"], "login-fake-1");
+    assert_eq!(envelope["data"]["status"], "pending");
+    assert!(envelope["data"].get("message").is_none());
+    assert_no_token_fields(&pending_json.stdout);
+
+    let configured_text = run_async(
+        &mut poll_client,
+        &["providers", "login-status", "--login-id", "login-fake-1"],
+    )
+    .await;
+    assert_eq!(configured_text.code, exit::OK);
+    assert_eq!(configured_text.stdout, "configured\n");
+
+    let configured_json = run_async(
+        &mut poll_client,
+        &[
+            "providers",
+            "login-status",
+            "--login-id",
+            "login-fake-1",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(configured_json.code, exit::OK);
+    let envelope = json_envelope(&configured_json);
+    assert_eq!(envelope["data"]["login_id"], "login-fake-1");
+    assert_eq!(envelope["data"]["status"], "configured");
+    assert!(envelope["data"].get("message").is_none());
+    assert_no_token_fields(&configured_json.stdout);
+
+    let failed_text = run_async(
+        &mut poll_client,
+        &["providers", "login-status", "--login-id", "login-fake-1"],
+    )
+    .await;
+    assert_eq!(failed_text.code, exit::INTERNAL);
+    assert_eq!(failed_text.stdout, "failed\n");
+
+    let failed_json = run_async(
+        &mut poll_client,
+        &[
+            "providers",
+            "login-status",
+            "--login-id",
+            "login-fake-1",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(failed_json.code, exit::INTERNAL);
+    let envelope = json_envelope(&failed_json);
+    assert_eq!(envelope["data"]["login_id"], "login-fake-1");
+    assert_eq!(envelope["data"]["status"], "failed");
+    assert_eq!(envelope["data"]["message"], "denied by user");
+    assert_no_token_fields(&failed_json.stdout);
+}
+
+#[tokio::test]
+async fn providers_login_refuses_insecure_remote_urls_even_with_override_flag() {
+    for insecure_url in [
+        "ws://worker.example/ws",
+        "ws://100.64.0.1:8765/ws",
+        "ws://user:pass@localhost/ws",
+        "wss:///ws",
+    ] {
+        let mut client = StubCopilotClient::new([]);
+        let login = run_async(
+            &mut client,
+            &[
+                "--connect",
+                insecure_url,
+                "--allow-insecure-remote",
+                "providers",
+                "login",
+                "--provider",
+                "github-copilot",
+                "--no-wait",
+            ],
+        )
+        .await;
+        assert_eq!(login.code, exit::USAGE, "{insecure_url}: {}", login.stderr);
+        assert!(
+            login.stderr.contains("wss:// or loopback ws://"),
+            "{insecure_url}: {}",
+            login.stderr
+        );
+        assert!(
+            client.recorded_requests.is_empty(),
+            "no request may be sent over insecure URL {insecure_url}"
+        );
+
+        let status = run_async(
+            &mut client,
+            &[
+                "--connect",
+                insecure_url,
+                "--allow-insecure-remote",
+                "providers",
+                "login-status",
+                "--login-id",
+                "login-fake-1",
+            ],
+        )
+        .await;
+        assert_eq!(
+            status.code,
+            exit::USAGE,
+            "{insecure_url}: {}",
+            status.stderr
+        );
+        assert!(
+            client.recorded_requests.is_empty(),
+            "no status request may be sent over insecure URL {insecure_url}"
+        );
+    }
+
+    // `run_remote` (used by loom-mcp) must also refuse before attempting to connect,
+    // even when `allow_insecure_remote` is true.
+    let remote = crate::cli::run_remote(
+        &owned(&[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--no-wait",
+        ]),
+        "ws://worker.example/ws",
+        "fake-bearer-for-test",
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(remote.exit_code, exit::USAGE);
+    let failure = remote.result.err().expect("insecure URL must fail");
+    assert_eq!(failure.code(), "invalid_request");
+    assert!(
+        failure.message().contains("wss:// or loopback ws://"),
+        "{}",
+        failure.message()
+    );
+
+    // Secure URLs (wss:// and loopback ws://) are accepted.
+    for secure_url in [
+        "wss://worker.example/ws",
+        "ws://127.0.0.1:8765/ws",
+        "ws://localhost:8765/ws",
+        "ws://[::1]:8765/ws",
+    ] {
+        let mut client = StubCopilotClient::new([]);
+        let outcome = run_async(
+            &mut client,
+            &[
+                "--connect",
+                secure_url,
+                "providers",
+                "login",
+                "--provider",
+                "github-copilot",
+                "--no-wait",
+            ],
+        )
+        .await;
+        assert_eq!(outcome.code, exit::OK, "{secure_url}: {}", outcome.stderr);
+    }
+}
+
+#[tokio::test]
+async fn providers_login_negotiates_configure_providers_and_fails_clearly_when_denied() {
+    let mut client = StubCopilotClient::new([]);
+    client.deny_capability = true;
+    let outcome = run_async(
+        &mut client,
+        &[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--no-wait",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(outcome.code, exit::BLOCKED);
+    let envelope = json_envelope(&outcome);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "capability_denied");
+    assert!(
+        matches!(
+            client.recorded_requests.first(),
+            Some(ClientRequest::Control(ControlRequest::Negotiate { capabilities, .. }))
+                if capabilities.contains(Capability::ConfigureProviders)
+        ),
+        "must negotiate configure_providers"
+    );
+
+    let mut status_client = StubCopilotClient::new([]);
+    status_client.deny_capability = true;
+    let status_outcome = run_async(
+        &mut status_client,
+        &[
+            "providers",
+            "login-status",
+            "--login-id",
+            "login-fake-1",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(status_outcome.code, exit::BLOCKED);
+    let envelope = json_envelope(&status_outcome);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "capability_denied");
 }

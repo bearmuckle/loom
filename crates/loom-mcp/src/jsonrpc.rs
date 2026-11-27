@@ -251,6 +251,8 @@ mod tests {
                 "archive",
                 "models_list",
                 "providers_list",
+                "copilot_login_start",
+                "copilot_login_status",
             ]
         );
         assert_eq!(
