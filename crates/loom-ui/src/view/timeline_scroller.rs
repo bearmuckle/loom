@@ -270,9 +270,13 @@ impl RenderOnce for TimelineScroller {
             jump_button_label,
             bottom_fade,
         } = self;
-        let (list_state, scrolled_up) = {
+        let (list_state, item_count, scrolled_up) = {
             let state = state.read(cx);
-            (state.list_state.clone(), state.is_scrolled_up())
+            (
+                state.list_state.clone(),
+                state.item_count(),
+                state.is_scrolled_up(),
+            )
         };
         let jump_button_visibility = transition(
             (root_id.clone(), "jump-button-visibility"),
@@ -337,9 +341,11 @@ impl RenderOnce for TimelineScroller {
             .id((root_id.clone(), "viewport"))
             .test_support()
             // Announce appended rows as a log region, like the transcript
-            // content of a web chat client.
+            // content of a web chat client. AccessKit reads `size_of_set` from
+            // the enclosing container when publishing `setsize` on items.
             .role(Role::Log)
             .aria_label("Session transcript")
+            .aria_size_of_set(item_count)
             .size_full()
             .min_h_0()
             .min_w_0()

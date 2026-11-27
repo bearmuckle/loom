@@ -157,6 +157,10 @@ impl Render for TimelineView {
             // reopen ladder applies. The list above is still synced, so the
             // final frame lands on the scroller state the whole roster implies.
             div()
+                .id("timeline-opening-log")
+                .test_support()
+                .role(Role::Log)
+                .aria_label("Session transcript")
                 .size_full()
                 .p_6()
                 .child(
@@ -217,16 +221,14 @@ impl Render for TimelineView {
                         });
                     }
                     let view = parent_for_rows.read(cx);
-                    let total_items = view.timeline.len();
                     let item = &view.timeline[index];
-                    let accessible_name = timeline_item_accessible_name(item, &view.collaboration);
+                    let accessible_name = view.timeline_item_accessible_name(item);
                     div()
                         .id(("timeline-item", index))
                         .test_support()
                         .role(Role::Article)
                         .aria_label(accessible_name)
                         .aria_position_in_set(index)
-                        .aria_size_of_set(total_items)
                         .w_full()
                         .flex()
                         .justify_center()
@@ -264,11 +266,29 @@ pub(crate) fn user_message_speaker(
     }
 }
 
+impl LoomView {
+    /// Concise accessible name for one rendered transcript row, matching the
+    /// parts currently visible under `output_detail`, `show_reasoning`, and
+    /// recorded `ask_user` questions.
+    pub(crate) fn timeline_item_accessible_name(&self, item: &TimelineItem) -> String {
+        timeline_item_accessible_name_with(
+            item,
+            &self.collaboration,
+            self.output_detail,
+            self.show_reasoning,
+            |part| self.question_for(part).map(|question| question.prompt),
+        )
+    }
+}
+
 /// Concise accessible name for one transcript row, combining speaker/kind with
-/// a single-line preview so assistive technology can scan messages in order.
-pub(crate) fn timeline_item_accessible_name(
+/// a single-line preview of what the row actually paints.
+pub(crate) fn timeline_item_accessible_name_with(
     item: &TimelineItem,
     collaboration: &crate::collaboration::CollaborationState,
+    output_detail: OutputDetail,
+    show_reasoning: bool,
+    mut question_prompt: impl FnMut(&ToolPart) -> Option<String>,
 ) -> String {
     match item {
         TimelineItem::User(text) => {
@@ -280,14 +300,12 @@ pub(crate) fn timeline_item_accessible_name(
                 format!("{speaker}: {preview}")
             }
         }
-        TimelineItem::Assistant(turn) => {
-            let summary = assistant_turn_accessible_summary(turn);
-            if summary.is_empty() {
-                "Agent".to_owned()
-            } else {
-                format!("Agent: {summary}")
-            }
-        }
+        TimelineItem::Assistant(turn) => assistant_turn_accessible_name(
+            turn,
+            output_detail,
+            show_reasoning,
+            &mut question_prompt,
+        ),
         TimelineItem::Collaboration(entry) => {
             let heading = crate::collaboration::entry_heading(entry);
             let preview = accessible_preview(&crate::collaboration::entry_text(entry));
@@ -323,7 +341,12 @@ pub(crate) fn timeline_item_accessible_name(
     }
 }
 
-fn assistant_turn_accessible_summary(turn: &AssistantTurn) -> String {
+fn assistant_turn_accessible_name(
+    turn: &AssistantTurn,
+    output_detail: OutputDetail,
+    show_reasoning: bool,
+    question_prompt: &mut impl FnMut(&ToolPart) -> Option<String>,
+) -> String {
     if let Some(preview) = turn.parts.iter().find_map(|part| match part {
         AssistantPart::Text(text) => {
             let preview = accessible_preview(text);
@@ -331,24 +354,45 @@ fn assistant_turn_accessible_summary(turn: &AssistantTurn) -> String {
         }
         _ => None,
     }) {
-        return preview;
+        return format!("Agent: {preview}");
     }
-    let tools = run_tool_parts(&turn.parts);
-    if !tools.is_empty() {
+    if let Some(prompt) = turn.parts.iter().find_map(|part| match part {
+        AssistantPart::Tool(tool) if tool.name == ASK_USER_TOOL => {
+            let prompt = question_prompt(tool)
+                .map(|text| accessible_preview(&text))
+                .unwrap_or_default();
+            Some(prompt)
+        }
+        _ => None,
+    }) {
+        return if prompt.is_empty() {
+            "Agent asks".to_owned()
+        } else {
+            format!("Agent asks: {prompt}")
+        };
+    }
+    let tools = run_tool_parts(&turn.parts)
+        .into_iter()
+        .filter(|tool| tool.name != ASK_USER_TOOL)
+        .collect::<Vec<_>>();
+    if !tools.is_empty() && (output_detail.shows_activity() || tool_needs_attention(&tools)) {
         let status = tool_group_status(&tools);
         return format!(
-            "Tools used: {}, {}",
+            "Agent: Tools used: {}, {}",
             tool_usage_summary(&tools),
             status.label()
         );
     }
-    if let Some(preview) = turn.parts.iter().find_map(|part| match part {
-        AssistantPart::Reasoning(text) => {
-            let preview = accessible_preview(text);
-            (!preview.is_empty()).then_some(format!("Reasoning: {preview}"))
-        }
-        _ => None,
-    }) {
+    if output_detail.shows_activity()
+        && show_reasoning
+        && let Some(preview) = turn.parts.iter().find_map(|part| match part {
+            AssistantPart::Reasoning(text) => {
+                let preview = accessible_preview(text);
+                (!preview.is_empty()).then_some(format!("Agent: Reasoning: {preview}"))
+            }
+            _ => None,
+        })
+    {
         return preview;
     }
     if turn
@@ -356,32 +400,46 @@ fn assistant_turn_accessible_summary(turn: &AssistantTurn) -> String {
         .iter()
         .any(|part| matches!(part, AssistantPart::Evidence(links) if !links.is_empty()))
     {
-        return "Evidence".to_owned();
+        return "Agent: Evidence".to_owned();
     }
-    String::new()
+    "Agent".to_owned()
 }
 
-fn accessible_preview(text: &str) -> String {
-    let mut out = String::new();
-    let mut count = 0usize;
-    for word in text.split_whitespace() {
-        let word_chars = word.chars().count();
-        if !out.is_empty() {
-            if count + 1 >= ACCESSIBLE_PREVIEW_MAX_CHARS {
-                out.push_str("...");
-                return out;
-            }
+pub(crate) fn accessible_preview(text: &str) -> String {
+    let mut words = text.split_whitespace().peekable();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let first_len = first.chars().count();
+    if first_len > ACCESSIBLE_PREVIEW_MAX_CHARS {
+        let mut out: String = first
+            .chars()
+            .take(ACCESSIBLE_PREVIEW_MAX_CHARS - 3)
+            .collect();
+        out.push_str("...");
+        return out;
+    }
+    let mut out = first.to_owned();
+    let mut count = first_len;
+    while let Some(word) = words.next() {
+        let word_len = word.chars().count();
+        let has_more = words.peek().is_some();
+        let limit = if has_more {
+            ACCESSIBLE_PREVIEW_MAX_CHARS - 3
+        } else {
+            ACCESSIBLE_PREVIEW_MAX_CHARS
+        };
+        if count + 1 + word_len <= limit {
             out.push(' ');
-            count += 1;
-        }
-        if count + word_chars > ACCESSIBLE_PREVIEW_MAX_CHARS {
-            let take = ACCESSIBLE_PREVIEW_MAX_CHARS.saturating_sub(count + 3);
-            out.extend(word.chars().take(take));
+            out.push_str(word);
+            count += 1 + word_len;
+        } else {
+            if count + 3 > ACCESSIBLE_PREVIEW_MAX_CHARS {
+                out = out.chars().take(ACCESSIBLE_PREVIEW_MAX_CHARS - 3).collect();
+            }
             out.push_str("...");
             return out;
         }
-        out.push_str(word);
-        count += word_chars;
     }
     out
 }
