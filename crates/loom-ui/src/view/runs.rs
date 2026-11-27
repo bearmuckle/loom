@@ -49,16 +49,15 @@ impl LoomView {
         if self.session_state == AgentSessionState::Archived {
             return None;
         }
-        if self.run_state.is_none() && self.session_state == AgentSessionState::Queued {
+        if self.run_state.is_none()
+            && matches!(
+                self.session_state,
+                AgentSessionState::Idle | AgentSessionState::Queued
+            )
+        {
             return None;
         }
         if let Some(run) = self.matched_active_run() {
-            if self.run_state.is_none()
-                && self.session_state == AgentSessionState::Idle
-                && run_state_is_terminal(run.state)
-            {
-                return None;
-            }
             return self.run_state.or(Some(run.state));
         }
         if let Some(state) = self.run_state {
@@ -151,6 +150,7 @@ impl LoomView {
     /// timestamp so the footer and inspector never snap backwards or climb
     /// while stopped.
     fn run_elapsed_ms_for(&self, run_state: Option<AgentRunState>, is_active: bool) -> Option<u64> {
+        run_state?;
         let usage_elapsed = self
             .review
             .usage
@@ -178,10 +178,30 @@ impl LoomView {
                     .saturating_sub(run.started_at.as_unix_millis()),
             );
         }
-        if run_state.is_some() && usage_elapsed > 0 {
+        if usage_elapsed > 0 {
             return Some(usage_elapsed);
         }
         None
+    }
+
+    /// Clears state that belongs to a single run when adopting a different run
+    /// ID (whether from a send response, run projection, or `RunStarted`).
+    pub(crate) fn reset_per_run_state(&mut self) {
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
+        self.transcript_before_ordinal = None;
+        self.transcript_loaded_ordinals.clear();
+        self.transcript_messages.clear();
+        self.transcript_has_older = false;
+        self.transcript_loading = false;
+        self.transcript_prepend_count = 0;
+        self.activity_records.clear();
+        // A plan belongs to one run, so a new run starts without one.
+        self.plan = None;
+        self.plan_collapsed = false;
+        self.review.clear_unread(InspectorTab::Run);
+        self.review.usage.run = None;
+        self.review.usage.run_provider = None;
+        self.context_inspection = None;
     }
 
     /// Adopts an authoritative run snapshot and keeps `active_run_id`,
@@ -195,6 +215,9 @@ impl LoomView {
             run.state = AgentRunState::Completed;
         }
         let state = run.state;
+        if self.active_run_id != Some(run.id) {
+            self.reset_per_run_state();
+        }
         self.active_run_id = Some(run.id);
         if !run.model.as_str().trim().is_empty() {
             self.model = run.model.clone();
