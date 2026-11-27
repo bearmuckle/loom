@@ -994,6 +994,35 @@ pub(crate) fn session_state_for_run(state: AgentRunState) -> AgentSessionState {
     }
 }
 
+pub(crate) fn run_state_for_session(state: AgentSessionState) -> Option<AgentRunState> {
+    match state {
+        AgentSessionState::Planning => Some(AgentRunState::Planning),
+        AgentSessionState::Executing => Some(AgentRunState::Executing),
+        AgentSessionState::AwaitingApproval => Some(AgentRunState::AwaitingApproval),
+        AgentSessionState::Paused => Some(AgentRunState::Paused),
+        AgentSessionState::NeedsInput => Some(AgentRunState::NeedsInput),
+        AgentSessionState::Evaluating => Some(AgentRunState::Evaluating),
+        AgentSessionState::Completed => Some(AgentRunState::Completed),
+        AgentSessionState::Failed => Some(AgentRunState::Failed),
+        AgentSessionState::Cancelled => Some(AgentRunState::Cancelled),
+        AgentSessionState::Idle | AgentSessionState::Queued | AgentSessionState::Archived => None,
+    }
+}
+
+pub(crate) fn run_state_is_active(state: AgentRunState) -> bool {
+    matches!(
+        state,
+        AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+    )
+}
+
+pub(crate) fn run_state_is_terminal(state: AgentRunState) -> bool {
+    matches!(
+        state,
+        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

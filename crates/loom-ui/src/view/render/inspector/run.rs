@@ -29,21 +29,22 @@ impl LoomView {
 
     /// The run's state, model, task, and elapsed time.
     fn render_run_card(&self) -> impl IntoElement {
-        let model = self
-            .active_run
+        let presentation = self.session_run_presentation();
+        let model = presentation
+            .run_model
             .as_ref()
-            .map(|run| run.model.as_str())
+            .map(ModelId::as_str)
             .unwrap_or_else(|| self.model.as_str())
             .to_owned();
         let task = self
-            .active_run
-            .as_ref()
+            .matched_active_run()
             .map(|run| run.task.clone())
             .or_else(|| {
                 self.session_task_cache
                     .get(&self.active_session.id)
                     .cloned()
             });
+        let status_label = session_status_label(presentation.session_state);
         let mut body = div()
             .id("run-status")
             .test_support()
@@ -57,15 +58,25 @@ impl LoomView {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(status_tag(self.session_state))
-                    .when_some(self.run_elapsed_ms(), |row, elapsed| {
+                    .child(
+                        div()
+                            .id("run-card-status")
+                            .test_support()
+                            .aria_label(status_label)
+                            .child(status_tag(presentation.session_state)),
+                    )
+                    .when_some(presentation.elapsed_ms, |row, elapsed| {
+                        let formatted = format_elapsed_ms(elapsed);
                         row.child(
                             div()
+                                .id("run-card-elapsed")
+                                .test_support()
+                                .aria_label(formatted.clone())
                                 .flex_shrink_0()
                                 .font_family(mono_font())
                                 .text_xs()
                                 .text_color(rgb(0x8f98a6))
-                                .child(format_elapsed_ms(elapsed)),
+                                .child(formatted),
                         )
                     }),
             )
@@ -301,22 +312,6 @@ impl LoomView {
             None => empty_note("No context inspection for this run.").into_any_element(),
         };
         card_with_action("Context", refresh, body)
-    }
-
-    /// How long the active run has been running, from usage when the backend
-    /// reported it and from the run timestamps otherwise.
-    fn run_elapsed_ms(&self) -> Option<u64> {
-        if let Some(usage) = self.review.usage.run.as_ref()
-            && usage.elapsed_ms > 0
-        {
-            return Some(usage.elapsed_ms);
-        }
-        let run = self.active_run.as_ref()?;
-        let end = run
-            .completed_at
-            .map(|timestamp| timestamp.as_unix_millis())
-            .unwrap_or_else(|| Timestamp::now().as_unix_millis());
-        Some(end.saturating_sub(run.started_at.as_unix_millis()))
     }
 }
 

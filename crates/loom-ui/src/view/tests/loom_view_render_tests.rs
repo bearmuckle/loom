@@ -2732,7 +2732,7 @@ fn agent_event_projection_handles_the_run_lifecycle_and_tool_fallback(cx: &mut T
                 Some(loom_protocol::AgentRunState::Completed)
             );
             assert!(view.pending_approval.is_none());
-            assert_eq!(view.pending_input.as_deref(), Some("Which branch?"));
+            assert!(view.pending_input.is_none());
             assert!(view.timeline.iter().any(|item| matches!(
                 item,
                 TimelineItem::Assistant(turn) if turn.parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text == "Finished the app update"))

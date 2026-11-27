@@ -139,20 +139,15 @@ impl LoomView {
         floor: Option<EventSequence>,
         fallback: Option<AgentRunSnapshotProjection>,
     ) {
-        // The projection is empty again, so the whole batch is applied and the
-        // cursor never ends below the floor the caller derived.
+        // The projection is empty again, so apply the durable run baseline at
+        // the snapshot cursor first and then replay the newer events journaled
+        // after it. Replaying the fallback last used to overwrite a newer
+        // `RunCompleted` or `Paused` event with the older snapshot state.
         self.reset_projection();
-        self.apply_event_batch(events, floor);
-        if let Some(projection) = fallback.as_ref() {
-            self.seed_plan_from_projection(projection);
-        }
-        // The durable run projection is applied whether or not the batch
-        // produced timeline items. Suppressing it would drop the run's control
-        // state, the transcript page that rebuilds the conversation, and the
-        // run polling that keeps it streaming.
         if let Some(projection) = fallback {
             self.apply_run_projection(projection);
         }
+        self.apply_event_batch(events, floor);
     }
 
     /// Applies a batch of journaled events in sequence order.
@@ -204,13 +199,10 @@ impl LoomView {
             ServerEvent::ProjectAgentMessageAccepted { .. } => {}
             ServerEvent::AgentSessionCreated { snapshot } => {
                 self.active_session = snapshot.clone();
-                self.session_state = snapshot.state;
-                self.update_session_list();
+                self.sync_session_state(snapshot.state);
             }
             ServerEvent::AgentSessionStateChanged { current, .. } => {
-                self.session_state = *current;
-                self.active_session.state = *current;
-                self.update_session_list();
+                self.sync_session_state(*current);
             }
             ServerEvent::AgentSessionForked { .. } => {}
             ServerEvent::AgentSessionTitleSourceChanged { session_id, source } => {
@@ -268,9 +260,7 @@ impl LoomView {
                     session.state = AgentSessionState::Archived;
                 }
                 if self.active_session.id == *session_id {
-                    self.session_state = AgentSessionState::Archived;
-                    self.active_session.state = AgentSessionState::Archived;
-                    self.update_session_list();
+                    self.sync_session_state(AgentSessionState::Archived);
                 }
             }
             ServerEvent::AgentSessionRestored { session_id } => {
@@ -284,9 +274,7 @@ impl LoomView {
                     session.state = AgentSessionState::Idle;
                 }
                 if self.active_session.id == *session_id {
-                    self.session_state = AgentSessionState::Idle;
-                    self.active_session.state = AgentSessionState::Idle;
-                    self.update_session_list();
+                    self.sync_session_state(AgentSessionState::Idle);
                 }
             }
             ServerEvent::Agent { event } => self.consume_agent_event(event),
@@ -479,8 +467,11 @@ impl LoomView {
             let before = self.active_session.clone();
             change(&mut self.active_session);
             if self.active_session != before {
-                self.session_state = self.active_session.state;
-                self.update_session_list();
+                if self.active_session.state != before.state {
+                    self.sync_session_state(self.active_session.state);
+                } else {
+                    self.update_session_list();
+                }
                 changed = true;
             }
         }
@@ -620,9 +611,14 @@ impl LoomView {
                         .push(TimelineItem::User(snapshot.task.clone()));
                 }
                 self.context_inspection = None;
-                self.active_run = Some(snapshot.clone());
-                self.active_run_id = Some(snapshot.id);
-                self.set_run_state(snapshot.state);
+                let stale_replay = self.active_run.as_ref().is_some_and(|existing| {
+                    existing.id == snapshot.id
+                        && (existing.updated_at > snapshot.updated_at
+                            || existing.control_revision > snapshot.control_revision)
+                });
+                if !stale_replay {
+                    self.adopt_active_run(snapshot.clone());
+                }
                 // A new run streams its own conversation into the open session,
                 // so the transcript below owns the timeline from here; holding
                 // it behind the opening placeholder would only blank the live
@@ -861,19 +857,16 @@ impl LoomView {
             AgentEvent::RecoveryRequired { reason, .. } => {
                 self.record_status(format!("Recovery required: {reason}"));
             }
-            AgentEvent::RunStateChanged { state, .. } => {
-                self.set_run_state(*state);
-                if matches!(
-                    state,
-                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
-                ) {
+            AgentEvent::RunStateChanged { run_id, state } => {
+                if self.active_run_id.is_none_or(|id| id == *run_id) {
+                    self.set_run_state(*state);
+                }
+                if run_state_is_terminal(*state) {
                     finish_assistant_turn(&mut self.timeline);
                 }
             }
             AgentEvent::RunCompleted { snapshot } => {
-                self.active_run = Some(snapshot.clone());
-                self.active_run_id = Some(snapshot.id);
-                self.set_run_state(snapshot.state);
+                self.adopt_active_run(snapshot.clone());
                 // The run is over, so stop the streaming cursor even when no
                 // completion summary is rendered.
                 finish_assistant_turn(&mut self.timeline);
@@ -973,14 +966,74 @@ impl LoomView {
     /// Applies a run state to the run and derives the session state from it.
     ///
     /// The session state mirrors the run state (the backend keeps them in step
-    /// the same way), so the session label the inspector shows and the run row
-    /// cannot report different states. The existing label helpers stay the
-    /// only formatting source for both.
+    /// the same way), so the session label the inspector shows, the sidebar
+    /// pills, the footer row, and the run controls cannot report different
+    /// states.
     pub(crate) fn set_run_state(&mut self, state: AgentRunState) {
         self.run_state = Some(state);
+        if let Some(run) = self
+            .active_run
+            .as_mut()
+            .filter(|run| self.active_run_id.is_none_or(|id| run.id == id))
+        {
+            run.state = state;
+        }
+        if run_state_is_terminal(state) {
+            self.pending_approval = None;
+            self.pending_input = None;
+        }
         self.session_state = session_state_for_run(state);
         self.active_session.state = self.session_state;
         self.update_session_list();
+        self.sync_active_session_in_project_snapshots();
+    }
+
+    /// Applies a session state change and reconciles the active run state,
+    /// sidebar row, and project snapshots with it so they never contradict
+    /// each other.
+    pub(crate) fn sync_session_state(&mut self, state: AgentSessionState) {
+        self.session_state = state;
+        self.active_session.state = state;
+        if let Some(run_state) = run_state_for_session(state) {
+            if self.active_run_id.is_some() || self.run_state.is_some() {
+                self.run_state = Some(run_state);
+                if let Some(run) = self
+                    .active_run
+                    .as_mut()
+                    .filter(|run| self.active_run_id.is_none_or(|id| run.id == id))
+                {
+                    run.state = run_state;
+                }
+            }
+            if run_state_is_terminal(run_state) {
+                self.pending_approval = None;
+                self.pending_input = None;
+            }
+        } else if state == AgentSessionState::Archived {
+            self.pending_approval = None;
+            self.pending_input = None;
+        }
+        self.update_session_list();
+        self.sync_active_session_in_project_snapshots();
+    }
+
+    /// Keeps cached project snapshots in step with the active session's state.
+    pub(crate) fn sync_active_session_in_project_snapshots(&mut self) {
+        let session_id = self.active_session.id;
+        let state = self.active_session.state;
+        for project in self
+            .project_tree_snapshots
+            .iter_mut()
+            .chain(self.project_snapshot.iter_mut())
+        {
+            for agent in project
+                .agents
+                .iter_mut()
+                .filter(|agent| agent.session_id == session_id)
+            {
+                agent.state = state;
+            }
+        }
     }
 
     /// Seeds the active plan from a run snapshot when the event stream has not
@@ -1005,11 +1058,12 @@ impl LoomView {
 
     pub(crate) fn apply_run_projection(&mut self, projection: AgentRunSnapshotProjection) {
         self.seed_plan_from_projection(&projection);
-        self.active_run_id = Some(projection.run.id);
-        self.active_run = Some(projection.run.clone());
-        self.set_run_state(projection.run.state);
-        self.pending_approval = projection.pending_approval;
-        self.pending_input = projection.pending_input;
+        let terminal = run_state_is_terminal(projection.run.state);
+        self.adopt_active_run(projection.run.clone());
+        if !terminal {
+            self.pending_approval = projection.pending_approval;
+            self.pending_input = projection.pending_input;
+        }
         let activity_records = projection.activities;
         for activity in &activity_records {
             self.activity_records.insert(activity.id, activity.clone());

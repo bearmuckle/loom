@@ -1,4 +1,5 @@
 use crate::collaboration::addressing_for;
+use crate::view::runs::SessionRunPresentation;
 
 use super::*;
 
@@ -13,6 +14,7 @@ impl LoomView {
             return self.render_sign_in_prompt(cx).into_any_element();
         }
         let permissions = self.session_permissions();
+        let presentation = self.session_run_presentation();
         let composer = self
             .composer_input
             .as_ref()
@@ -25,7 +27,7 @@ impl LoomView {
             "Observers can read this session but not send messages"
         } else if addressing.to_people {
             "Message the people in this session (not sent to the agent)..."
-        } else if self.pending_input.is_some() {
+        } else if presentation.has_pending_input {
             "Answer the agent question..."
         } else if self.sending_message {
             "Sending direction..."
@@ -300,26 +302,26 @@ impl LoomView {
                                     .items_center()
                                     .gap_2()
                                     .when(permissions.can_act, |element| {
-                                        element
-                                            .children(self.render_run_control_buttons(layout, cx))
+                                        element.children(self.render_run_control_buttons(
+                                            &presentation,
+                                            layout,
+                                            cx,
+                                        ))
                                     })
-                                    .when(
-                                        self.run_can_interrupt() && permissions.can_act,
-                                        |element| {
-                                            element.child(
-                                                Button::new("interrupt-run")
-                                                    .label("Stop")
-                                                    .danger()
-                                                    .when(layout.phone, |button| {
-                                                        button.small().h(layout.control_size())
-                                                    })
-                                                    .when(!layout.phone, |button| button.small())
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.interrupt_active_run(cx);
-                                                    })),
-                                            )
-                                        },
-                                    )
+                                    .when(presentation.can_stop && permissions.can_act, |element| {
+                                        element.child(
+                                            Button::new("interrupt-run")
+                                                .label("Stop")
+                                                .danger()
+                                                .when(layout.phone, |button| {
+                                                    button.small().h(layout.control_size())
+                                                })
+                                                .when(!layout.phone, |button| button.small())
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.interrupt_active_run(cx);
+                                                })),
+                                        )
+                                    })
                                     .child(
                                         Button::new("send-message")
                                             .icon(Icon::new(AssetIconName::ArrowUp))
@@ -419,25 +421,26 @@ impl LoomView {
     /// the server accepts them.
     fn render_run_control_buttons(
         &self,
+        presentation: &SessionRunPresentation,
         layout: ResponsiveLayout,
         cx: &mut Context<Self>,
     ) -> Vec<Button> {
         let mut buttons = Vec::new();
         let candidates = [
             (
-                self.run_can_pause(),
+                presentation.can_pause,
                 "pause-run",
                 "Pause",
                 loom_core::RunControlAction::Pause,
             ),
             (
-                self.run_can_resume(),
+                presentation.can_resume,
                 "resume-run",
                 "Resume",
                 loom_core::RunControlAction::Resume,
             ),
             (
-                self.run_can_retry(),
+                presentation.can_retry,
                 "retry-run",
                 "Retry",
                 loom_core::RunControlAction::Retry,

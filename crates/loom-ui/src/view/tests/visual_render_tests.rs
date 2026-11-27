@@ -340,3 +340,127 @@ fn phone_layout_renders_a_distinct_frame() {
         "the phone layout should differ from the desktop layout"
     );
 }
+
+#[test]
+fn run_states_render_distinct_consistent_frames() {
+    let now_ms = Timestamp::now().as_unix_millis();
+    let started_at = Timestamp::from_unix_millis(now_ms.saturating_sub(41 * 60 * 1_000));
+    let settled_at = Timestamp::from_unix_millis(started_at.as_unix_millis() + 103_000);
+
+    let run_model = ModelId::for_provider(
+        &loom_model::ProviderId::new("anthropic"),
+        &ModelId::new("claude-sonnet-4"),
+    );
+
+    let finished_after_tools = capture(|view| {
+        view.sessions = vec![view.active_session.clone()];
+        view.models.clear();
+        let run = loom_protocol::AgentRunSnapshot {
+            id: RunId::new(),
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 1,
+            session_id: view.active_session.id,
+            task: "Harden loom-mcp against review findings".to_owned(),
+            jev: None,
+            model: run_model.clone(),
+            state: AgentRunState::Completed,
+            started_at,
+            updated_at: settled_at,
+            completed_at: Some(settled_at),
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        };
+        view.adopt_active_run(run);
+        view.timeline = vec![
+            TimelineItem::User("Harden loom-mcp against review findings".to_owned()),
+            TimelineItem::Assistant(AssistantTurn {
+                parts: vec![AssistantPart::Tool(Box::new(ToolPart {
+                    id: ToolCallId::new(),
+                    name: "run_command".to_owned(),
+                    title: "cargo test".to_owned(),
+                    status: ToolPartStatus::Completed,
+                    detail: Some("cargo test".to_owned()),
+                    output: Some("ok".to_owned()),
+                    elapsed_ms: Some(103_000),
+                    approval_pending: false,
+                    policy: None,
+                }))],
+                streaming: false,
+            }),
+        ];
+    });
+
+    let running = capture(|view| {
+        view.sessions = vec![view.active_session.clone()];
+        let run = loom_protocol::AgentRunSnapshot {
+            id: RunId::new(),
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 1,
+            session_id: view.active_session.id,
+            task: "Harden loom-mcp against review findings".to_owned(),
+            jev: None,
+            model: run_model.clone(),
+            state: AgentRunState::Evaluating,
+            started_at: Timestamp::from_unix_millis(now_ms.saturating_sub(15_000)),
+            updated_at: Timestamp::from_unix_millis(now_ms),
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        };
+        view.adopt_active_run(run);
+    });
+
+    let paused = capture(|view| {
+        view.sessions = vec![view.active_session.clone()];
+        view.models.clear();
+        let run = loom_protocol::AgentRunSnapshot {
+            id: RunId::new(),
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 1,
+            session_id: view.active_session.id,
+            task: "Harden loom-mcp against review findings".to_owned(),
+            jev: None,
+            model: run_model.clone(),
+            state: AgentRunState::Paused,
+            started_at,
+            updated_at: settled_at,
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        };
+        view.adopt_active_run(run);
+    });
+
+    let no_model = capture(|view| {
+        view.sessions = vec![view.active_session.clone()];
+        view.models.clear();
+        view.default_models.clear();
+        view.model = ModelId::new("default");
+        view.default_model = ModelId::new("default");
+    });
+
+    for (name, frame) in [
+        ("finished_after_tools", &finished_after_tools),
+        ("running", &running),
+        ("paused", &paused),
+        ("no_model", &no_model),
+    ] {
+        assert!(
+            frame.has_aspect_ratio(1280, 800),
+            "{name} should keep the 1280x800 aspect ratio"
+        );
+        assert!(
+            frame.distinct_colors() > 8,
+            "{name} should paint visible chrome and text"
+        );
+    }
+
+    assert_ne!(finished_after_tools.fingerprint(), running.fingerprint());
+    assert_ne!(finished_after_tools.fingerprint(), paused.fingerprint());
+    assert_ne!(finished_after_tools.fingerprint(), no_model.fingerprint());
+    assert_ne!(running.fingerprint(), paused.fingerprint());
+    assert_ne!(paused.fingerprint(), no_model.fingerprint());
+}

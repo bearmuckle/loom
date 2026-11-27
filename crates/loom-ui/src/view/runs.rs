@@ -1,6 +1,187 @@
 use super::*;
 
+/// The single derived run-state presentation for the active session.
+///
+/// The footer status row, elapsed timer, inspector header/card, sidebar row
+/// pills, composer placeholder/model line, and Pause/Resume/Retry/Stop buttons
+/// all read from this projection so they cannot report incompatible states at
+/// the same time.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SessionRunPresentation {
+    pub(crate) run_state: Option<AgentRunState>,
+    pub(crate) session_state: AgentSessionState,
+    pub(crate) is_active: bool,
+    pub(crate) has_pending_input: bool,
+    pub(crate) has_pending_approval: bool,
+    pub(crate) show_mark: bool,
+    pub(crate) status_label: &'static str,
+    pub(crate) status_color: Rgba,
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) show_interrupt_hint: bool,
+    pub(crate) can_pause: bool,
+    pub(crate) can_resume: bool,
+    pub(crate) can_retry: bool,
+    pub(crate) can_stop: bool,
+    pub(crate) run_model: Option<ModelId>,
+}
+
 impl LoomView {
+    /// The `active_run` snapshot when it matches `active_run_id` (or when a
+    /// view state established `run_state` alongside `active_run` directly).
+    pub(crate) fn matched_active_run(&self) -> Option<&AgentRunSnapshot> {
+        let run = self.active_run.as_ref()?;
+        match self.active_run_id {
+            Some(run_id) if run.id == run_id => Some(run),
+            Some(_) => None,
+            None if self.run_state.is_some() => Some(run),
+            None => None,
+        }
+    }
+
+    /// The canonical run state for the active session.
+    ///
+    /// A matching run snapshot's terminal state or completion timestamp wins
+    /// over a stale non-terminal `run_state`. When neither a matching run nor
+    /// `run_state` is set, a non-idle `session_state` supplies the matching run
+    /// state so the footer and sidebar pills stay in agreement.
+    pub(crate) fn effective_run_state(&self) -> Option<AgentRunState> {
+        if let Some(run) = self.matched_active_run() {
+            if run_state_is_terminal(run.state) {
+                return Some(run.state);
+            }
+            if run.completed_at.is_some()
+                && self
+                    .run_state
+                    .is_none_or(|state| !run_state_is_terminal(state))
+            {
+                return Some(AgentRunState::Completed);
+            }
+            return self.run_state.or(Some(run.state));
+        }
+        if let Some(state) = self.run_state {
+            return Some(state);
+        }
+        run_state_for_session(self.session_state)
+    }
+
+    /// Derives every user-visible run-state surface from one source of truth.
+    pub(crate) fn session_run_presentation(&self) -> SessionRunPresentation {
+        let run_state = self.effective_run_state();
+        let session_state = run_state
+            .map(session_state_for_run)
+            .unwrap_or(self.session_state);
+        let is_active = run_state.is_some_and(run_state_is_active);
+        let is_terminal = run_state.is_some_and(run_state_is_terminal);
+        let has_pending_input = self.pending_input.is_some() && !is_terminal;
+        let has_pending_approval = self.pending_approval.is_some() && !is_terminal;
+        let show_mark = is_active || self.sending_message || has_pending_input;
+        let waiting_for_children = self.project_has_live_children() && !is_active;
+        let (status_label, status_color) = if let Some(state) = run_state {
+            let label = if waiting_for_children {
+                "Waiting for sub-agents"
+            } else {
+                run_state_label(Some(state))
+            };
+            (label, run_state_color(state))
+        } else if self.sending_message {
+            ("Sending", rgb(0x93c5fd))
+        } else if has_pending_input {
+            ("Waiting for your answer", rgb(0xfbbf24))
+        } else {
+            ("Ready", rgb(0x64748b))
+        };
+        let has_controllable_run = self.active_run_id.is_some()
+            && self
+                .active_run
+                .as_ref()
+                .is_none_or(|run| Some(run.id) == self.active_run_id);
+        let can_stop =
+            has_controllable_run && run_state.is_some_and(|state| !run_state_is_terminal(state));
+        let can_pause = can_stop && run_state != Some(AgentRunState::Paused);
+        let can_resume = has_controllable_run
+            && run_state == Some(AgentRunState::Paused)
+            && !waiting_for_children;
+        let can_retry = has_controllable_run && run_state == Some(AgentRunState::Failed);
+        let show_interrupt_hint = is_active && can_stop;
+        let elapsed_ms = self.run_elapsed_ms_for(is_active);
+        let run_model = self
+            .matched_active_run()
+            .map(|run| run.model.clone())
+            .filter(|model| !model.as_str().trim().is_empty());
+
+        SessionRunPresentation {
+            run_state,
+            session_state,
+            is_active,
+            has_pending_input,
+            has_pending_approval,
+            show_mark,
+            status_label,
+            status_color,
+            elapsed_ms,
+            show_interrupt_hint,
+            can_pause,
+            can_resume,
+            can_retry,
+            can_stop,
+            run_model,
+        }
+    }
+
+    /// Computes run elapsed time in milliseconds.
+    ///
+    /// Active runs tick against the current clock; paused, waiting, and
+    /// finished runs freeze at their completion or last-update timestamp so the
+    /// footer and inspector never show a live climbing timer after work stops.
+    fn run_elapsed_ms_for(&self, is_active: bool) -> Option<u64> {
+        if let Some(run) = self.matched_active_run() {
+            if let Some(completed_at) = run.completed_at {
+                return Some(
+                    completed_at
+                        .as_unix_millis()
+                        .saturating_sub(run.started_at.as_unix_millis()),
+                );
+            }
+            if !is_active {
+                if let Some(usage) = self.review.usage.run.as_ref()
+                    && usage.elapsed_ms > 0
+                {
+                    return Some(usage.elapsed_ms);
+                }
+                return Some(
+                    run.updated_at
+                        .as_unix_millis()
+                        .saturating_sub(run.started_at.as_unix_millis()),
+                );
+            }
+            return Some(
+                Timestamp::now()
+                    .as_unix_millis()
+                    .saturating_sub(run.started_at.as_unix_millis()),
+            );
+        }
+        if let Some(usage) = self.review.usage.run.as_ref()
+            && usage.elapsed_ms > 0
+        {
+            return Some(usage.elapsed_ms);
+        }
+        None
+    }
+
+    /// Adopts an authoritative run snapshot and keeps `active_run_id`,
+    /// `run_state`, `session_state`, `active_session.state`, sidebar rows,
+    /// project snapshots, and the session's model in sync.
+    pub(crate) fn adopt_active_run(&mut self, run: AgentRunSnapshot) {
+        let state = run.state;
+        self.active_run_id = Some(run.id);
+        if !run.model.as_str().trim().is_empty() {
+            self.model = run.model.clone();
+            self.session_models
+                .insert(self.active_session.id, run.model.clone());
+        }
+        self.active_run = Some(run);
+        self.set_run_state(state);
+    }
     pub(crate) fn send_message(&mut self, message: String, cx: &mut Context<Self>) {
         self.status_banner = None;
         #[cfg(target_family = "wasm")]
@@ -120,7 +301,7 @@ impl LoomView {
     /// guards keep a stale card, a double click, or a read-only connection from
     /// sending anything.
     pub(crate) fn answer_question(&mut self, answer: String, cx: &mut Context<Self>) {
-        if self.pending_input.is_none() || self.sending_message {
+        if !self.session_run_presentation().has_pending_input || self.sending_message {
             return;
         }
         if !self.session_permissions().can_act {
@@ -140,10 +321,7 @@ impl LoomView {
             | Ok(ServerResponse::Run(RunResponse::AgentRun(run))) => {
                 self.session_task_cache
                     .insert(self.active_session.id, run.task.clone());
-                self.active_run = Some(run);
-                self.active_run_id = self.active_run.as_ref().map(|run| run.id);
-                self.run_state = self.active_run.as_ref().map(|run| run.state);
-                self.session_state = AgentSessionState::Executing;
+                self.adopt_active_run(run);
                 if let Some(run) = &self.active_run
                     && !self
                         .timeline
@@ -155,15 +333,6 @@ impl LoomView {
                 }
                 self.pending_input = None;
                 self.start_run_polling(cx);
-                if let Some(run) = &self.active_run
-                    && !self
-                        .timeline
-                        .iter()
-                        .any(|item| matches!(item, TimelineItem::User(text) if text == &run.task))
-                {
-                    self.timeline
-                        .insert(0, TimelineItem::User(run.task.clone()));
-                }
                 self.refresh_review(cx);
             }
             Err(error) => self.record_backend_error("send message", error),
@@ -246,11 +415,7 @@ impl LoomView {
         match response.result {
             Ok(ServerResponse::Run(RunResponse::AgentRun(run)))
             | Ok(ServerResponse::Run(RunResponse::AgentRunStarted(run))) => {
-                self.active_run = Some(run.clone());
-                self.active_run_id = Some(run.id);
-                self.run_state = Some(run.state);
-                self.session_state = session_state_for_run(run.state);
-                self.active_session.state = self.session_state;
+                self.adopt_active_run(run);
                 self.start_run_polling(cx);
             }
             Err(error) => {
@@ -267,33 +432,32 @@ impl LoomView {
 
     /// Whether the active run can still be interrupted.
     pub(crate) fn run_can_interrupt(&self) -> bool {
-        self.active_run_id.is_some()
-            && !matches!(
-                self.run_state,
-                Some(AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled)
-            )
+        self.session_run_presentation().can_stop
     }
 
     /// Whether the active run can be paused: live and not already paused.
+    #[cfg(test)]
     pub(crate) fn run_can_pause(&self) -> bool {
-        self.run_can_interrupt() && self.run_state != Some(AgentRunState::Paused)
+        self.session_run_presentation().can_pause
     }
 
     /// Whether the active run is paused and can be resumed.
+    #[cfg(test)]
     pub(crate) fn run_can_resume(&self) -> bool {
-        self.active_run_id.is_some() && self.run_state == Some(AgentRunState::Paused)
+        self.session_run_presentation().can_resume
     }
 
     /// Whether the active run failed; the server retries a failed tool step.
+    #[cfg(test)]
     pub(crate) fn run_can_retry(&self) -> bool {
-        self.active_run_id.is_some() && self.run_state == Some(AgentRunState::Failed)
+        self.session_run_presentation().can_retry
     }
 
     pub(crate) fn interrupt_active_run(&mut self, cx: &mut Context<Self>) {
         if !self.session_permissions().can_act {
             return;
         }
-        if self.active_run_id.is_none() {
+        if !self.run_can_interrupt() {
             return;
         }
         self.control_run(loom_core::RunControlAction::Interrupt, cx);
@@ -309,11 +473,7 @@ impl LoomView {
         match response.result {
             Ok(ServerResponse::Run(RunResponse::AgentRun(run)))
             | Ok(ServerResponse::Run(RunResponse::AgentRunStarted(run))) => {
-                self.active_run_id = Some(run.id);
-                self.active_run = Some(run.clone());
-                self.run_state = Some(run.state);
-                self.session_state = session_state_for_run(run.state);
-                self.active_session.state = self.session_state;
+                self.adopt_active_run(run);
             }
             Err(error) => self.record_backend_error(operation, error),
             Ok(response) => {

@@ -1,6 +1,47 @@
 use super::*;
 
 impl LoomView {
+    /// The label shown in the session model picker when `SelectState` has no
+    /// catalog entry selected.
+    ///
+    /// If a model was used for the run, the footer shows that model instead of
+    /// claiming that no model is configured. Only a session with no run model
+    /// and no configured catalog models shows "No model is configured".
+    pub(crate) fn model_picker_placeholder(&self) -> String {
+        let active_node = self
+            .session_node_ids
+            .get(&self.active_session.id)
+            .map(String::as_str)
+            .unwrap_or(&self.default_backend_node_id);
+        let active_provider_names = self.node_model_provider_names.get(active_node);
+        let presentation = self.session_run_presentation();
+        if let Some(run_model) = presentation.run_model.as_ref() {
+            return model_choice_label(run_model, active_provider_names);
+        }
+        let has_named_model = {
+            let raw = self.model.as_str().trim();
+            !raw.is_empty() && raw != "default" && raw != "deterministic/demo"
+        };
+        if !self.models.is_empty() {
+            if has_named_model {
+                return model_choice_label(&self.model, active_provider_names);
+            }
+            return "Select a model".to_owned();
+        }
+        if self.model_refreshes_in_flight.contains(active_node) && has_named_model {
+            return model_choice_label(&self.model, active_provider_names);
+        }
+        "No model is configured".to_owned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_picker_display_label(&self, cx: &App) -> String {
+        self.model_select
+            .as_ref()
+            .and_then(|state| state.read(cx).selected_value().cloned())
+            .unwrap_or_else(|| self.model_picker_placeholder())
+    }
+
     pub(crate) fn render_model_picker(
         &self,
         phone: bool,
@@ -14,6 +55,7 @@ impl LoomView {
             picker = picker.flex_1().h(px(44.));
         }
         if let Some(state) = &self.model_select {
+            let placeholder = self.model_picker_placeholder();
             picker = picker.child(
                 div()
                     .flex()
@@ -40,7 +82,7 @@ impl LoomView {
                             .small()
                             .appearance(false)
                             .accessibility_label("Model for this session")
-                            .placeholder("No model is configured")
+                            .placeholder(placeholder)
                             .search_placeholder("Search models"),
                     ),
             );

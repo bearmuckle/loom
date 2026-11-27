@@ -76,13 +76,17 @@ impl LoomView {
                                     .text_color(rgb(0xe5e7eb))
                                     .child(title),
                             )
-                            .child(
+                            .child({
+                                let summary = self.inspector_status_summary();
                                 div()
+                                    .id("inspector-status-summary")
+                                    .test_support()
+                                    .aria_label(summary.clone())
                                     .truncate()
                                     .text_xs()
                                     .text_color(rgb(0x8f98a6))
-                                    .child(self.inspector_status_summary()),
-                            ),
+                                    .child(summary)
+                            }),
                     )
                     .child(
                         Button::new("close-inspector")
@@ -131,7 +135,8 @@ impl LoomView {
     fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let changed_files = self.github_changed_file_count();
-        let pending_attention = self.pending_approval.is_some() || self.pending_input.is_some();
+        let presentation = self.session_run_presentation();
+        let pending_attention = presentation.has_pending_approval || presentation.has_pending_input;
         div().w_full().child(
             TabBar::new("inspector-tabs")
                 .underline()
@@ -224,7 +229,7 @@ impl LoomView {
                 })
                 .unwrap_or_else(|| "VCS unavailable".to_owned()),
             InspectorTab::Run => {
-                let state = session_status_label(self.session_state);
+                let state = session_status_label(self.session_run_presentation().session_state);
                 match self.plan.as_ref().filter(|plan| !plan.is_empty()) {
                     Some(plan) => {
                         format!("{state}  ·  {}/{} steps", plan.done_count(), plan.total())
