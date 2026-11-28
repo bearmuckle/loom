@@ -623,6 +623,9 @@ fn a_tool_that_needs_approval_ends_the_turn_and_runs_once_approved() {
     let body = format!(
         r#"#!/bin/sh
 echo "$@" >> '{log}'
+case "$*" in
+  *'--resume gone'*) echo "No conversation found with session ID: gone" >&2; exit 1;;
+esac
 read first
 echo "$first" >> '{log}'
 printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s-4","tools":[]}}'
@@ -667,6 +670,7 @@ done
     assert_eq!(call.name, CLAUDE_CODE_PERMISSION_TOOL);
     assert_eq!(call.arguments["tool"], "Bash");
     assert_eq!(call.arguments["input"], json!({"command": "make"}));
+    assert_eq!(call.arguments["claude_session"], "s-4");
     assert_eq!(
         sink.events.last(),
         Some(&ModelStreamEvent::Completed {
@@ -711,9 +715,41 @@ done
     assert!(approved_inputs(&declined).is_empty());
     let (prompt, _) = provider.next_prompt(&request(declined.clone()));
     assert!(prompt.contains("The user declined Bash"), "{prompt}");
-    // A restarted worker has no CLI session and still hears the decision.
+    // A provider built for the resumed run, or after a worker restart, finds
+    // the CLI session in the parked call and continues it.
     provider.reset();
-    let (prompt, _) = provider.next_prompt(&request(declined));
+    let (prompt, _) = provider.next_prompt(&request(declined.clone()));
+    assert_eq!(provider.claude_session.as_deref(), Some("s-4"));
+    assert!(
+        prompt.starts_with("[Loom] The user declined Bash"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("[User] build it"), "{prompt}");
+    // A recorded session the CLI no longer has falls back to a recap once,
+    // instead of failing every retry on the same id.
+    let mut gone = declined.clone();
+    gone[1].tool_calls[0].arguments["claude_session"] = json!("gone");
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), &script);
+    provider.bind_workspace(&dir);
+    std::fs::write(&log, "").unwrap();
+    let mut sink = loom_model::CollectingSink::default();
+    provider
+        .stream(&request(gone), &CancellationToken::default(), &mut sink)
+        .unwrap();
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(seen.contains("--resume gone"), "{seen}");
+    assert!(seen.contains("[User] build it"), "{seen}");
+    assert_eq!(provider.claude_session.as_deref(), Some("s-4"));
+    // A transcript from before the session was recorded falls back to a recap.
+    let mut older = declined;
+    older[1].tool_calls[0]
+        .arguments
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_session");
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), &script);
+    let (prompt, _) = provider.next_prompt(&request(older));
+    assert!(provider.claude_session.is_none());
     assert!(
         prompt.contains("[User] build it") && prompt.contains("declined Bash"),
         "{prompt}"

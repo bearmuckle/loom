@@ -38,6 +38,8 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(200);
 /// The longest tool description streamed as reasoning.
 const SUMMARY_BYTES: usize = 160;
+/// The permission call argument that keeps the CLI's session id.
+const CLAUDE_SESSION_ARGUMENT: &str = "claude_session";
 
 pub struct ClaudeCodeProvider {
     descriptor: ModelDescriptor,
@@ -85,6 +87,9 @@ impl ClaudeCodeProvider {
     /// seen. A fresh one carries what came before as a labelled recap, because
     /// Loom's journal, not the CLI's memory, is the record of the session.
     fn next_prompt(&mut self, request: &ModelRequest) -> (String, Option<String>) {
+        if self.claude_session.is_none() && self.delivered == 0 {
+            self.restore_parked_session(&request.messages);
+        }
         if request.messages.len() < self.delivered {
             // Compaction removed messages the CLI had seen.
             self.claude_session = None;
@@ -149,6 +154,30 @@ impl ClaudeCodeProvider {
         (prompt, (!system.is_empty()).then_some(system))
     }
 
+    /// Picks up the CLI conversation a parked approval left behind.
+    ///
+    /// A fresh provider knows nothing of the CLI's session. When the last reply
+    /// in the transcript is a permission call that recorded one, the CLI is
+    /// still at that point, so the run continues it and sends only what came
+    /// after: the decision and any message typed meanwhile.
+    fn restore_parked_session(&mut self, messages: &[ModelMessage]) {
+        let Some(index) = messages
+            .iter()
+            .rposition(|message| message.role == MessageRole::Assistant)
+        else {
+            return;
+        };
+        let id = messages[index]
+            .tool_calls
+            .iter()
+            .filter(|call| call.name == CLAUDE_CODE_PERMISSION_TOOL)
+            .find_map(|call| call.arguments.get(CLAUDE_SESSION_ARGUMENT)?.as_str());
+        if let Some(id) = id {
+            self.claude_session = Some(id.to_owned());
+            self.delivered = index + 1;
+        }
+    }
+
     /// Ends the turn with the call that asks the person to approve `tool`.
     fn ask_for_approval(
         &mut self,
@@ -173,17 +202,24 @@ impl ClaudeCodeProvider {
             }
         }
         let summary = tool_summary(&tool, &input);
+        let mut arguments = serde_json::json!({
+            "tool": tool,
+            "input": input,
+            "summary": summary.trim_start_matches("→ ").trim_end(),
+        });
+        // The run parks here and its provider is dropped. Keeping the CLI's
+        // session id in the transcript lets the provider of the resumed run
+        // continue that conversation instead of starting one from a recap.
+        if let Some(id) = &self.claude_session {
+            arguments[CLAUDE_SESSION_ARGUMENT] = serde_json::Value::String(id.clone());
+        }
         emit(
             sink,
             ModelStreamEvent::ToolCallDelta {
                 call: ToolCall {
                     id: ToolCallId::new(),
                     name: CLAUDE_CODE_PERMISSION_TOOL.to_owned(),
-                    arguments: serde_json::json!({
-                        "tool": tool,
-                        "input": input,
-                        "summary": summary.trim_start_matches("→ ").trim_end(),
-                    }),
+                    arguments,
                 },
             },
         )?;
@@ -548,6 +584,9 @@ impl ModelProvider for ClaudeCodeProvider {
                 "there is no new user message to send to Claude Code",
             ));
         }
+        let resuming = self.claude_session.is_some();
+        // Whether the CLI opened the conversation; a rejected resume never does.
+        let mut started = false;
         let mut session = ClaudeCodeSession::spawn(&self.options(cwd, system))?;
         session.send_user_message(&prompt)?;
         let mut stopping = false;
@@ -571,6 +610,18 @@ impl ModelProvider for ClaudeCodeProvider {
             }
             let event = match session.next_event(POLL) {
                 Next::Idle => continue,
+                Next::Exited if resuming && !started && !stopping => {
+                    // The CLI no longer has the conversation the transcript
+                    // recorded, for example after its files were cleared.
+                    // Retrying the id would fail every turn, so continue once
+                    // from the journal instead. Nothing reached the sink yet.
+                    log::warn!(
+                        "claude could not resume its session, continuing from a recap: {}",
+                        session.stderr_tail().trim()
+                    );
+                    self.claude_session = None;
+                    return self.stream(request, cancel, sink);
+                }
                 Next::Exited => {
                     return Err(LoomError::new(
                         ErrorCode::ProviderUnavailable,
@@ -595,6 +646,7 @@ impl ModelProvider for ClaudeCodeProvider {
             let reasoning = |text: String| ModelStreamEvent::ReasoningDelta { text };
             let flow = match event {
                 ClaudeEvent::Init { session_id, .. } => {
+                    started = true;
                     self.claude_session = Some(session_id);
                     StreamFlow::Continue
                 }
