@@ -118,11 +118,9 @@ impl ClaudeCodeProvider {
         let messages = &request.messages;
         let cwd = self.cwd.as_deref();
         if self.claude_session.is_some() {
-            let news = (self.delivered.min(messages.len())..messages.len())
-                .filter_map(|index| unseen_at(messages, index, cwd))
-                .collect::<Vec<_>>();
-            if !news.is_empty() {
-                return (news.join("\n\n"), None);
+            let (notes, unanswered) = pending(messages, self.delivered.min(messages.len()), cwd);
+            if let Some(prompt) = pending_prompt(&notes, &unanswered) {
+                return (prompt, None);
             }
             // Nothing is new, so the reply the last turn counted is not in the
             // transcript: the turn was cancelled or failed before its answer
@@ -136,40 +134,34 @@ impl ClaudeCodeProvider {
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        // Everything after the last reply is still unanswered: the user's
-        // messages and any permission decision, in the order they came. A
-        // message typed while a call waited for approval is one of them, so it
-        // reaches the CLI next to the decision instead of hiding it.
+        // Everything after the last reply is still unanswered: the approval
+        // decisions and the user's messages, in the order they came. A message
+        // typed while a call waited for approval is one of them, so it reaches
+        // the CLI as a message to answer instead of hiding in the history.
         let start = messages
             .iter()
             .rposition(|message| message.role == MessageRole::Assistant)
             .map_or(0, |index| index + 1);
-        let latest = (start..messages.len())
-            .filter_map(|index| unseen_at(messages, index, cwd))
-            .collect::<Vec<_>>();
+        let (notes, unanswered) = pending(messages, start, cwd);
+        let latest = pending_prompt(&notes, &unanswered);
         let recap = messages[..start]
             .iter()
             .filter_map(recap_line)
             .collect::<Vec<_>>()
             .join("\n\n");
         const INTRO: &str = "This conversation has earlier messages, kept here as a transcript.";
-        let prompt = match (recap.is_empty(), latest.as_slice()) {
-            (_, []) if recap.is_empty() => String::new(),
+        let prompt = match (recap.is_empty(), latest) {
+            (true, None) => String::new(),
             // The last kept turn is already a reply, as after a cancelled turn,
             // so the CLI is asked to carry on from it instead of being handed an
             // empty prompt.
-            (false, []) => {
+            (false, None) => {
                 format!("{INTRO} Treat it as history and continue from where it stops.\n\n{recap}")
             }
-            (true, latest) => latest.join("\n\n"),
-            (false, [latest]) => format!(
-                "{INTRO} Treat it as history and answer the latest message.\n\n{recap}\n\n\
-                 Latest message:\n{latest}"
-            ),
-            (false, latest) => format!(
-                "{INTRO} Treat it as history and answer the latest messages.\n\n{recap}\n\n\
-                 Latest messages:\n{}",
-                latest.join("\n\n")
+            (true, Some(latest)) => latest,
+            (false, Some(latest)) => format!(
+                "{INTRO} Treat it as history and carry on with the latest messages.\n\n{recap}\n\n\
+                 {latest}"
             ),
         };
         (prompt, (!system.is_empty()).then_some(system))
@@ -464,10 +456,70 @@ fn unseen_at(messages: &[ModelMessage], index: usize, cwd: Option<&Path>) -> Opt
     }
 }
 
+/// The transcript after `start`, split into what the CLI has to act on and what
+/// is still waiting for an answer: the approval notes, and the user's messages.
+fn pending(
+    messages: &[ModelMessage],
+    start: usize,
+    cwd: Option<&Path>,
+) -> (Vec<String>, Vec<String>) {
+    let mut notes = Vec::new();
+    let mut unanswered = Vec::new();
+    for index in start.min(messages.len())..messages.len() {
+        if let Some(decided) = decided_at(messages, index) {
+            notes.push(decided.note(cwd));
+        } else if let Some(text) = untouched_user_message(messages, index) {
+            unanswered.push(text);
+        }
+    }
+    (notes, unanswered)
+}
+
+fn untouched_user_message(messages: &[ModelMessage], index: usize) -> Option<String> {
+    let message = messages.get(index)?;
+    (message.role == MessageRole::User && !message.content.trim().is_empty())
+        .then(|| message.content.clone())
+}
+
+/// The part of a prompt that asks the CLI to act on what it has not seen.
+///
+/// The approval notes come first, because the call they name has to be dealt
+/// with before anything else; the messages the person typed while the call
+/// waited come after, so they are answered rather than read as history.
+fn pending_prompt(notes: &[String], unanswered: &[String]) -> Option<String> {
+    if notes.is_empty() && unanswered.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !notes.is_empty() {
+        parts.push(notes.join("\n\n"));
+    }
+    if !unanswered.is_empty() {
+        let messages = unanswered.join("\n\n");
+        if notes.is_empty() {
+            // Nothing waits for a decision, so these are simply the messages to
+            // answer.
+            parts.push(messages);
+        } else {
+            let (what, them) = if unanswered.len() == 1 {
+                ("this", "it")
+            } else {
+                ("these", "them")
+            };
+            parts.push(format!(
+                "The person wrote {what} while the call waited for approval. Answer {them} once \
+                 you have dealt with that call:\n{messages}"
+            ));
+        }
+    }
+    Some(parts.join("\n\n"))
+}
+
 /// One message of a recap, or `None` when it carries nothing to recall.
 ///
 /// An assistant turn that only called tools still says which, so the recap
-/// shows what was done instead of an empty line.
+/// shows what was done instead of an empty line. A tool's result is kept to its
+/// first line, so the recap says what a call found without replaying it whole.
 fn recap_line(message: &ModelMessage) -> Option<String> {
     match message.role {
         MessageRole::User => Some(format!("[User] {}", message.content)),
@@ -494,6 +546,12 @@ fn recap_line(message: &ModelMessage) -> Option<String> {
                 }))
                 .collect::<Vec<_>>();
             (!lines.is_empty()).then(|| lines.join("\n"))
+        }
+        // A decision is carried by the approval note, not by the recap.
+        MessageRole::Tool if message.name.as_deref() == Some(CLAUDE_CODE_PERMISSION_TOOL) => None,
+        MessageRole::Tool => {
+            let result = message.content.trim();
+            (!result.is_empty()).then(|| format!("[Tool result] {}", shorten(result)))
         }
         _ => None,
     }

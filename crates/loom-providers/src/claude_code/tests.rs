@@ -57,7 +57,7 @@ fn a_session_with_nothing_new_continues_from_the_journal() {
         message(MessageRole::User, "three"),
     ]));
     assert!(prompt.contains("[User] one"), "{prompt}");
-    assert!(prompt.ends_with("Latest message:\nthree"), "{prompt}");
+    assert!(prompt.ends_with("\n\nthree"), "{prompt}");
     assert_eq!(provider.claude_session, None);
     assert_eq!(system, None);
 }
@@ -208,7 +208,7 @@ fn a_fresh_conversation_with_history_gets_a_labelled_recap() {
         message(MessageRole::User, "three"),
     ]));
     assert!(prompt.contains("[User] one") && prompt.contains("[Assistant] two"));
-    assert!(prompt.ends_with("Latest message:\nthree"));
+    assert!(prompt.ends_with("\n\nthree"));
     assert_eq!(system, None);
 }
 
@@ -275,8 +275,52 @@ fn a_recap_names_tool_calls_and_skips_empty_turns() {
         !prompt.contains("[Assistant] \n") && !prompt.contains("[Assistant]  "),
         "{prompt}"
     );
-    assert!(!prompt.contains("clean"), "tool output stays out: {prompt}");
-    assert!(prompt.ends_with("Latest message:\ntwo"), "{prompt}");
+    assert!(
+        prompt.contains("[Tool result] clean"),
+        "a short result says what a call found: {prompt}"
+    );
+    assert!(
+        !prompt.contains("[Tool result] approved"),
+        "a decision is not a tool result: {prompt}"
+    );
+    assert!(prompt.ends_with("two"), "{prompt}");
+}
+
+#[test]
+fn a_recap_keeps_a_short_result_and_leaves_out_an_empty_one() {
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), "claude");
+    let mut empty = message(MessageRole::Tool, "   ");
+    empty.name = Some("run_command".to_owned());
+    let (prompt, _) = provider.next_prompt(&request(vec![
+        message(MessageRole::User, "one"),
+        message(MessageRole::Assistant, "two"),
+        empty,
+        message(MessageRole::Tool, "nothing to commit\nworking tree clean"),
+        message(MessageRole::Assistant, "three"),
+        message(MessageRole::User, "four"),
+    ]));
+    assert!(
+        prompt.contains("[Tool result] nothing to commit"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("working tree clean") && !prompt.contains("[Tool result] \n"),
+        "one short line only: {prompt}"
+    );
+
+    let long = "x".repeat(SUMMARY_BYTES * 2);
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), "claude");
+    let (prompt, _) = provider.next_prompt(&request(vec![
+        message(MessageRole::User, "one"),
+        message(MessageRole::Assistant, "two"),
+        message(MessageRole::Tool, &long),
+        message(MessageRole::Assistant, "four"),
+        message(MessageRole::User, "five"),
+    ]));
+    assert!(
+        prompt.contains(&format!("[Tool result] {}…", "x".repeat(SUMMARY_BYTES))),
+        "the long result is cut to one line: {prompt}"
+    );
 }
 
 #[test]
@@ -294,17 +338,27 @@ fn a_message_typed_during_an_approval_reaches_the_cli_with_the_decision() {
         prompt.contains("[User] build it\n\n[Assistant called Bash: make]"),
         "{prompt}"
     );
-    assert!(
-        prompt.contains("Latest messages:\n[Loom] The user approved Bash"),
-        "{prompt}"
-    );
+    assert!(prompt.contains("[Loom] The user approved Bash"), "{prompt}");
     assert!(
         prompt.contains("The working directory is /work/root."),
         "{prompt}"
     );
-    assert!(prompt.ends_with("\n\nstatus?"), "{prompt}");
+    // The message typed while the call waited is asked to be answered after it,
+    // and it comes after the note, which names the call to deal with first.
+    assert!(
+        prompt.contains(
+            "The person wrote this while the call waited for approval. Answer it once you have \
+             dealt with that call:\nstatus?"
+        ),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("status?"), "{prompt}");
+    assert!(
+        prompt.find("[Loom] The user approved Bash").unwrap() < prompt.find("status?").unwrap(),
+        "{prompt}"
+    );
 
-    // A continued conversation hears both too, in order.
+    // A continued conversation hears both too, with the same order.
     provider.claude_session = Some("s-1".to_owned());
     provider.delivered = 2;
     let [asked, answered] = decided("Bash", json!({"command": "make"}), "denied");
@@ -313,15 +367,46 @@ fn a_message_typed_during_an_approval_reaches_the_cli_with_the_decision() {
         asked,
         answered,
         message(MessageRole::User, "status?"),
+        message(MessageRole::User, "and then?"),
     ]));
     assert!(
         prompt.starts_with("[Loom] The user declined Bash"),
         "{prompt}"
     );
     assert!(
-        prompt.contains("/work/root.") && prompt.ends_with("\n\nstatus?"),
+        prompt.contains(
+            "The person wrote these while the call waited for approval. Answer them once you \
+             have dealt with that call:\nstatus?\n\nand then?"
+        ),
         "{prompt}"
     );
+    assert!(prompt.ends_with("and then?"), "{prompt}");
+    assert!(!prompt.contains("[User] build it"), "{prompt}");
+}
+
+#[test]
+fn a_decided_call_is_answered_before_the_messages_after_it() {
+    // The decision is unseen, so the CLI is told both about it and about what
+    // the person wrote after it, in that order.
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), "claude");
+    provider.claude_session = Some("s-1".to_owned());
+    provider.delivered = 2;
+    let [asked, answered] = decided("Bash", json!({"command": "make"}), "approved");
+    let (prompt, _) = provider.next_prompt(&request(vec![
+        message(MessageRole::User, "build it"),
+        asked,
+        answered,
+        message(MessageRole::User, "status?"),
+    ]));
+    assert!(
+        prompt.starts_with("[Loom] The user approved Bash"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("Answer it once you have dealt with that call:\nstatus?"),
+        "{prompt}"
+    );
+    assert_eq!(provider.claude_session.as_deref(), Some("s-1"));
 }
 
 #[test]
