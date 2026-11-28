@@ -10,13 +10,21 @@
 //! The CLI runs in the session's working directory, signed in as the account
 //! that runs the worker. Nothing here reads that login.
 //!
-//! A tool the CLI wants approved ends the turn. The provider refuses the
-//! request, interrupts the CLI and returns a [`CLAUDE_CODE_PERMISSION_TOOL`]
-//! call, which Loom's own policy and approval prompt judge like any other tool
-//! call. Once the person approves it, the next turn tells the CLI to retry and
-//! allows exactly that tool input. A decision lives in the transcript, so a
-//! restarted worker still honours it. Edits inside the working directory and
-//! read-only commands never ask.
+//! The CLI process outlives the turn: it waits in a per-session pool
+//! ([`live`]) for the next run, so a background command it started keeps
+//! running and the working directory it moved to is kept.
+//!
+//! A tool the CLI wants approved ends the turn with a
+//! [`CLAUDE_CODE_PERMISSION_TOOL`] call, which Loom's own policy and approval
+//! prompt judge like any other tool call. The CLI's request stays open in the
+//! kept process, and the next run answers it there with the exact input that
+//! was asked about, so nothing is replayed. When the process is gone, as after
+//! a worker restart, the next turn resumes the CLI's conversation, tells it to
+//! retry, and allows exactly that tool input: a decision lives in the
+//! transcript. Edits inside the working directory and read-only commands never
+//! ask.
+
+mod live;
 
 use std::{path::Path, process::Command, time::Duration};
 
@@ -184,23 +192,7 @@ impl ClaudeCodeProvider {
         request: &ModelRequest,
         sink: &mut dyn ModelStreamSink,
         (tool, input): (String, serde_json::Value),
-        summary: Option<loom_harness::ResultSummary>,
     ) -> Result<()> {
-        if let Some(summary) = summary {
-            emit(
-                sink,
-                ModelStreamEvent::Usage {
-                    usage: TokenUsage {
-                        input_tokens: summary.usage.input + summary.usage.cache_creation,
-                        output_tokens: summary.usage.output,
-                        cached_input_tokens: summary.usage.cache_read,
-                    },
-                },
-            )?;
-            if let Some(id) = summary.session_id {
-                self.claude_session = Some(id);
-            }
-        }
         let summary = tool_summary(&tool, &input);
         let mut arguments = serde_json::json!({
             "tool": tool,
@@ -231,6 +223,95 @@ impl ClaudeCodeProvider {
         )?;
         self.delivered = request.messages.len() + 1;
         Ok(())
+    }
+
+    /// Where this session's kept process waits: the session's own build cache
+    /// when the instance keeps one, else its working directory.
+    fn pool_key(&self, cwd: &Path) -> PathBuf {
+        self.build_cache
+            .clone()
+            .unwrap_or_else(|| cwd.to_path_buf())
+    }
+
+    /// What a process is started with, apart from its prompt; a kept process
+    /// started differently is not reused.
+    fn launch(&self, cwd: &Path) -> String {
+        format!(
+            "{}|{}|{:?}|{:?}",
+            self.binary.display(),
+            cwd.display(),
+            self.alias(),
+            self.build_env()
+        )
+    }
+
+    /// Keeps `live` for the next run, recording what it has seen.
+    fn keep(
+        &self,
+        key: PathBuf,
+        mut live: live::Live,
+        request: &ModelRequest,
+        pending: Option<live::Pending>,
+    ) {
+        let messages = &request.messages;
+        live.claude_session = self.claude_session.clone();
+        live.delivered = self.delivered;
+        live.seen = live::digest(&messages[..self.delivered.min(messages.len())]);
+        live.pending = pending;
+        live::put(key, live);
+    }
+
+    /// The answer to a call the kept process still waits on, and the user
+    /// messages to send once its turn ends.
+    ///
+    /// The decision answers the request in place, with the input that was
+    /// asked about. A person who wrote instead of deciding is not taken to
+    /// have approved, and the CLI reads what they wrote with the refusal.
+    fn answer(
+        &self,
+        pending: &live::Pending,
+        messages: &[ModelMessage],
+    ) -> (PermissionDecision, Vec<String>) {
+        let cwd = self.cwd.as_deref();
+        let mut decision = None;
+        let mut rest = Vec::new();
+        for index in self.delivered.min(messages.len())..messages.len() {
+            if let Some(decided) = decided_at(messages, index).filter(|decided| {
+                decision.is_none() && decided.tool == pending.tool && decided.input == pending.input
+            }) {
+                decision = Some(decided.approved);
+            } else if let Some(text) = unseen_at(messages, index, cwd) {
+                rest.push(text);
+            }
+        }
+        let tool = &pending.tool;
+        match decision {
+            Some(true) => (
+                PermissionDecision::Allow {
+                    input: pending.input.clone(),
+                },
+                rest,
+            ),
+            Some(false) => (
+                PermissionDecision::Deny {
+                    message: format!(
+                        "The user declined {tool} in Loom's approval prompt. Do not run it; \
+                         continue another way or say what you need."
+                    ),
+                },
+                rest,
+            ),
+            None => {
+                let mut message = format!(
+                    "The user did not approve {tool} in Loom's approval prompt. Do not run it."
+                );
+                if !rest.is_empty() {
+                    message.push_str(" They wrote instead:\n\n");
+                    message.push_str(&rest.join("\n\n"));
+                }
+                (PermissionDecision::Deny { message }, Vec::new())
+            }
+        }
     }
 
     fn options(&self, cwd: PathBuf, system: Option<String>) -> ClaudeCodeOptions {
@@ -555,6 +636,14 @@ fn wait_until(at: u64) -> String {
     }
 }
 
+/// What a turn first tells the CLI process.
+enum Opening {
+    /// A new user turn.
+    Prompt(String),
+    /// The answer to the permission request the kept process waits on.
+    Answer(String, PermissionDecision),
+}
+
 impl ModelProvider for ClaudeCodeProvider {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -577,39 +666,136 @@ impl ModelProvider for ClaudeCodeProvider {
         let cwd = self.cwd.clone().ok_or_else(|| {
             LoomError::invalid_request("Claude Code needs the session's working directory")
         })?;
+        if cancel.is_cancelled() {
+            // Nothing is started for a turn that is already cancelled; a kept
+            // process stays in the pool for the next one.
+            return Err(loom_model::cancelled_error());
+        }
         let approved = approved_inputs(&request.messages);
-        let (prompt, system) = self.next_prompt(request);
-        if prompt.trim().is_empty() {
+        let key = self.pool_key(&cwd);
+        let launch = self.launch(&cwd);
+        let kept = live::take(&key).filter(|live| live.fits(&launch, &request.messages));
+        let reused = kept.is_some();
+        // What this provider knew before adopting a kept process; a retry after
+        // that process turns out dead starts from it again.
+        let prior = (self.claude_session.clone(), self.delivered);
+        // The first thing the process is told, and the user messages that wait
+        // for the end of its turn.
+        let (mut live, opening, mut queued) = match kept {
+            Some(mut live) => {
+                self.claude_session = live.claude_session.clone();
+                self.delivered = live.delivered;
+                let mut queued = std::mem::take(&mut live.queued);
+                match live.pending.take() {
+                    Some(pending) => {
+                        let (decision, rest) = self.answer(&pending, &request.messages);
+                        queued.extend(rest);
+                        (live, Opening::Answer(pending.request_id, decision), queued)
+                    }
+                    None => {
+                        // Whatever the CLI said after its last turn, such as a
+                        // background command finishing, is not this turn's.
+                        let stale = live.session.drain();
+                        if !stale.is_empty() {
+                            log::debug!(
+                                "claude said {} things between turns; they stay in its own \
+                                 conversation",
+                                stale.len()
+                            );
+                        }
+                        let (prompt, _) = self.next_prompt(request);
+                        queued.insert(0, prompt);
+                        let prompt = queued.join("\n\n");
+                        (live, Opening::Prompt(prompt), Vec::new())
+                    }
+                }
+            }
+            None => {
+                let (prompt, system) = self.next_prompt(request);
+                if prompt.trim().is_empty() {
+                    return Err(LoomError::invalid_request(
+                        "there is no new user message to send to Claude Code",
+                    ));
+                }
+                let session = ClaudeCodeSession::spawn(&self.options(cwd, system))?;
+                (
+                    live::Live::new(session, launch),
+                    Opening::Prompt(prompt),
+                    Vec::new(),
+                )
+            }
+        };
+        if let Opening::Prompt(prompt) = &opening
+            && prompt.trim().is_empty()
+        {
+            self.keep(key, live, request, None);
             return Err(LoomError::invalid_request(
                 "there is no new user message to send to Claude Code",
             ));
         }
-        let resuming = self.claude_session.is_some();
-        // Whether the CLI opened the conversation; a rejected resume never does.
+        let opened = match &opening {
+            Opening::Prompt(prompt) => live.session.send_user_message(prompt),
+            Opening::Answer(request_id, decision) => {
+                live.session.respond_permission(request_id, decision)
+            }
+        };
+        let resuming = !reused && self.claude_session.is_some();
+        if let Err(error) = opened {
+            if reused {
+                // The kept process died in the meantime; start a new one.
+                drop(live);
+                (self.claude_session, self.delivered) = prior;
+                return self.stream(request, cancel, sink);
+            }
+            if resuming {
+                // A rejected resume can exit before the prompt is written.
+                log::warn!(
+                    "claude could not resume its session, continuing from a recap: {}",
+                    live.session.stderr_tail().trim()
+                );
+                self.claude_session = None;
+                return self.stream(request, cancel, sink);
+            }
+            return Err(error);
+        }
+        if let Opening::Answer(_, decision) = &opening {
+            let verdict = match decision {
+                PermissionDecision::Allow { .. } => "approved",
+                PermissionDecision::Deny { .. } => "declined",
+            };
+            emit(
+                sink,
+                ModelStreamEvent::ReasoningDelta {
+                    text: format!("  ✓ answered in place: {verdict}\n"),
+                },
+            )?;
+        }
+        // Whether the process said anything; a rejected resume never does.
         let mut started = false;
-        let mut session = ClaudeCodeSession::spawn(&self.options(cwd, system))?;
-        session.send_user_message(&prompt)?;
         let mut stopping = false;
         let mut stop_deadline = None;
-        // The tool the CLI asked for that the person has not approved yet.
-        let mut asked: Option<(String, serde_json::Value)> = None;
         let mut reply = ReplyText::default();
+        let mut usage = TokenUsage::default();
         // The limits the CLI reported during this turn, if any.
         let mut seen_limits: Option<UsageLimits> = None;
         loop {
             if !stopping && cancel.is_cancelled() {
                 stopping = true;
                 stop_deadline = Some(Instant::now() + INTERRUPT_GRACE);
-                let _ = session.interrupt();
+                let _ = live.session.interrupt();
             }
             if stop_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                if let (Some(tool), false) = (asked.take(), cancel.is_cancelled()) {
-                    return self.ask_for_approval(request, sink, tool, None);
-                }
+                // The CLI did not wind down in time; dropping it ends it.
                 return Err(loom_model::cancelled_error());
             }
-            let event = match session.next_event(POLL) {
+            let event = match live.session.next_event(POLL) {
                 Next::Idle => continue,
+                Next::Exited if reused && !started && !stopping => {
+                    log::debug!("the kept claude process exited; starting a new one");
+                    drop(live);
+                    (self.claude_session, self.delivered) = prior;
+                    return self.stream(request, cancel, sink);
+                }
                 Next::Exited if resuming && !started && !stopping => {
                     // The CLI no longer has the conversation the transcript
                     // recorded, for example after its files were cleared.
@@ -617,28 +803,30 @@ impl ModelProvider for ClaudeCodeProvider {
                     // from the journal instead. Nothing reached the sink yet.
                     log::warn!(
                         "claude could not resume its session, continuing from a recap: {}",
-                        session.stderr_tail().trim()
+                        live.session.stderr_tail().trim()
                     );
                     self.claude_session = None;
                     return self.stream(request, cancel, sink);
                 }
+                // An interrupted CLI may exit instead of reporting a result.
+                Next::Exited if stopping => return Err(loom_model::cancelled_error()),
                 Next::Exited => {
                     return Err(LoomError::new(
                         ErrorCode::ProviderUnavailable,
                         format!(
                             "claude exited before finishing the turn: {}",
-                            session.stderr_tail().trim()
+                            live.session.stderr_tail().trim()
                         ),
                         true,
                     ));
                 }
                 Next::Event(event) => event,
             };
+            started = true;
             if stopping {
-                if let ClaudeEvent::Result(summary) = event {
-                    if let (Some(tool), false) = (asked.take(), cancel.is_cancelled()) {
-                        return self.ask_for_approval(request, sink, tool, Some(summary));
-                    }
+                if matches!(event, ClaudeEvent::Result(_)) {
+                    // The process wound down and stays for the next run.
+                    self.keep(key, live, request, None);
                     return Err(loom_model::cancelled_error());
                 }
                 continue;
@@ -646,7 +834,6 @@ impl ModelProvider for ClaudeCodeProvider {
             let reasoning = |text: String| ModelStreamEvent::ReasoningDelta { text };
             let flow = match event {
                 ClaudeEvent::Init { session_id, .. } => {
-                    started = true;
                     self.claude_session = Some(session_id);
                     StreamFlow::Continue
                 }
@@ -687,31 +874,31 @@ impl ModelProvider for ClaudeCodeProvider {
                         .iter()
                         .any(|(tool, allowed)| *tool == tool_name && *allowed == input)
                     {
-                        session.respond_permission(
+                        live.session.respond_permission(
                             &request_id,
                             &PermissionDecision::Allow { input },
                         )?;
                         emit(sink, reasoning(format!("  ✓ {tool_name} approved\n")))?
                     } else {
-                        session.respond_permission(
-                            &request_id,
-                            &PermissionDecision::Deny {
-                                message: format!(
-                                    "{tool_name} needs the user's approval. Stop now and wait; \
-                                     do not retry it or work around it."
-                                ),
-                            },
-                        )?;
-                        if asked.is_none() {
-                            asked = Some((tool_name.clone(), input));
-                            stopping = true;
-                            stop_deadline = Some(Instant::now() + INTERRUPT_GRACE);
-                            let _ = session.interrupt();
-                        }
+                        // The request stays open in the process, which waits
+                        // in the pool until the person decides.
                         emit(
                             sink,
                             reasoning(format!("  ? {tool_name} waits for approval\n")),
-                        )?
+                        )?;
+                        self.ask_for_approval(request, sink, (tool_name.clone(), input.clone()))?;
+                        live.queued = queued;
+                        self.keep(
+                            key,
+                            live,
+                            request,
+                            Some(live::Pending {
+                                request_id,
+                                tool: tool_name,
+                                input,
+                            }),
+                        );
+                        return Ok(());
                     }
                 }
                 ClaudeEvent::PermissionDenied { tool_name, .. } => emit(
@@ -720,6 +907,7 @@ impl ModelProvider for ClaudeCodeProvider {
                 )?,
                 ClaudeEvent::Result(summary) => {
                     if summary.is_error {
+                        self.keep(key, live, request, None);
                         return Err(LoomError::new(
                             ErrorCode::ProviderUnavailable,
                             format!(
@@ -728,6 +916,20 @@ impl ModelProvider for ClaudeCodeProvider {
                             ),
                             false,
                         ));
+                    }
+                    usage.input_tokens += summary.usage.input + summary.usage.cache_creation;
+                    usage.output_tokens += summary.usage.output;
+                    usage.cached_input_tokens += summary.usage.cache_read;
+                    if let Some(id) = summary.session_id.clone() {
+                        self.claude_session = Some(id);
+                    }
+                    if !queued.is_empty() {
+                        // Messages written while a call waited go in now that
+                        // the turn they arrived during is over.
+                        let next = std::mem::take(&mut queued).join("\n\n");
+                        live.session.send_user_message(&next)?;
+                        reply.tool_call();
+                        continue;
                     }
                     if reply.is_empty() {
                         // Nothing reached the stream, so the turn would end with
@@ -750,6 +952,7 @@ impl ModelProvider for ClaudeCodeProvider {
                                 )?;
                             }
                             None => {
+                                self.keep(key, live, request, None);
                                 return Err(LoomError::new(
                                     ErrorCode::ProviderUnavailable,
                                     empty_turn_message(seen_limits.as_ref()),
@@ -758,27 +961,16 @@ impl ModelProvider for ClaudeCodeProvider {
                             }
                         }
                     }
-                    emit(
-                        sink,
-                        ModelStreamEvent::Usage {
-                            usage: TokenUsage {
-                                input_tokens: summary.usage.input + summary.usage.cache_creation,
-                                output_tokens: summary.usage.output,
-                                cached_input_tokens: summary.usage.cache_read,
-                            },
-                        },
-                    )?;
+                    emit(sink, ModelStreamEvent::Usage { usage })?;
                     emit(
                         sink,
                         ModelStreamEvent::Completed {
                             reason: FinishReason::Stop,
                         },
                     )?;
-                    if let Some(id) = summary.session_id {
-                        self.claude_session = Some(id);
-                    }
                     // The reply the runtime stores next is one more message.
                     self.delivered = request.messages.len() + 1;
+                    self.keep(key, live, request, None);
                     return Ok(());
                 }
                 ClaudeEvent::RateLimit {
@@ -817,7 +1009,7 @@ impl ModelProvider for ClaudeCodeProvider {
                 | ClaudeEvent::Other { .. } => StreamFlow::Continue,
             };
             if flow == StreamFlow::Stop {
-                let _ = session.interrupt();
+                let _ = live.session.interrupt();
                 return Ok(());
             }
         }

@@ -603,6 +603,20 @@ impl ClaudeCodeSession {
         }
     }
 
+    /// Takes every event already waiting, without blocking.
+    ///
+    /// A child kept between turns can say more after a turn ends, for example
+    /// when a background command finishes. Draining before the next prompt
+    /// keeps that output from being read as the next turn's.
+    pub fn drain(&mut self) -> Vec<ClaudeEvent> {
+        self.events.try_iter().collect()
+    }
+
+    /// Whether the child has exited.
+    pub fn has_exited(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(None))
+    }
+
     /// The end of the child's stderr, for an error message.
     pub fn stderr_tail(&self) -> String {
         self.stderr_tail

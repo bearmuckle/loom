@@ -416,7 +416,7 @@ echo "$@" >> '{args}'
 printf 'env:%s|%s|%s\n' "${{CARGO_TARGET_DIR}}" "${{CARGO_INCREMENTAL}}" "${{CARGO_PROFILE_DEV_DEBUG}}" >> '{args}'
 n=$(( $(cat '{count}' 2>/dev/null || echo 0) + 1 ))
 echo "$n" > '{count}'
-if [ "$n" -ge 4 ]; then
+if [ "$n" -ge 3 ]; then
 printf '%s\n' '{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","isUsingOverage":false,"unifiedWindows":{{"seven_day":{{"utilization":1.0,"resetsAt":1795566000,"status":"rejected"}}}}}}}}'
 printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"s-9"}}'
 exit 0
@@ -540,7 +540,8 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
     assert!(seen.contains("--resume s-9"), "{seen}");
     assert!(seen.contains("again"), "{seen}");
 
-    // A cancelled token interrupts the turn and ends it as cancelled.
+    // A turn cancelled before it starts ends as cancelled without running the
+    // CLI, so the blocked turn below is the script's third run.
     let token = CancellationToken::default();
     token.cancel();
     let error = provider
@@ -704,10 +705,21 @@ done
             reason: FinishReason::Stop
         })
     );
+    // The kept process is answered in place: one launch, no resume, and no
+    // approval note replayed as a new user turn.
     let seen = std::fs::read_to_string(&log).unwrap();
-    assert!(seen.contains("--resume s-4"), "{seen}");
-    assert!(seen.contains("The user approved Bash"), "{seen}");
+    assert_eq!(seen.matches("--output-format").count(), 1, "{seen}");
+    assert!(!seen.contains("--resume"), "{seen}");
+    assert!(!seen.contains("The user approved Bash"), "{seen}");
     assert!(seen.contains("\"behavior\":\"allow\""), "{seen}");
+    assert!(
+        sink.events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ReasoningDelta { text } if text.contains("answered in place: approved")
+        )),
+        "{:?}",
+        sink.events
+    );
 
     // A rejection is told to the CLI and grants nothing.
     let mut declined = history;
@@ -754,6 +766,69 @@ done
         prompt.contains("[User] build it") && prompt.contains("declined Bash"),
         "{prompt}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_later_turn_reuses_the_running_process_only_for_its_own_transcript() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("loom-claude-live-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("log.txt");
+    let script = dir.join("claude");
+    let body = format!(
+        r#"#!/bin/sh
+echo "launch $*" >> '{log}'
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s-9","tools":[]}}'
+while read line; do
+  echo "$line" >> '{log}'
+  printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-9","usage":{{}}}}'
+done
+"#,
+        log = log.display()
+    );
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let launches = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("launch ")
+            .count()
+    };
+    let turn = |messages: Vec<ModelMessage>| {
+        let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), &script);
+        provider.bind_workspace(&dir);
+        let mut sink = loom_model::CollectingSink::default();
+        provider
+            .stream(&request(messages), &CancellationToken::default(), &mut sink)
+            .unwrap();
+        assert_eq!(
+            sink.events.last(),
+            Some(&ModelStreamEvent::Completed {
+                reason: FinishReason::Stop
+            })
+        );
+    };
+
+    // Each run builds a new provider, as the runtime does; the process stays.
+    turn(vec![message(MessageRole::User, "first")]);
+    turn(vec![
+        message(MessageRole::User, "first"),
+        message(MessageRole::Assistant, "ok"),
+        message(MessageRole::User, "second"),
+    ]);
+    assert_eq!(launches(), 1);
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        seen.contains("second") && !seen.contains("[User] first"),
+        "{seen}"
+    );
+
+    // A transcript the process has not seen gets a process of its own.
+    turn(vec![message(MessageRole::User, "elsewhere")]);
+    assert_eq!(launches(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
