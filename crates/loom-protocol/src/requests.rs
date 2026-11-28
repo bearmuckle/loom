@@ -39,6 +39,10 @@ pub enum ControlRequest {
     },
 }
 
+fn default_interactive() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum WorkspaceRequest {
@@ -65,6 +69,22 @@ pub enum WorkspaceRequest {
     CreateAgentSessionInWorkspace {
         workspace_id: WorkspaceId,
         name: String,
+    },
+
+    /// Creates a session backed by an external ACP harness (such as
+    /// Antigravity's official `agy acp` binary). Requires the
+    /// `acp_agent_sessions` and `create_agent_session` capabilities. The
+    /// harness command itself is configured strictly on the worker side
+    /// (`LOOM_ANTIGRAVITY_ACP_COMMAND` or PATH discovery), never supplied by
+    /// clients over the wire.
+    CreateAcpAgentSessionInWorkspace {
+        workspace_id: WorkspaceId,
+        name: String,
+        harness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_method: Option<String>,
+        #[serde(default = "default_interactive")]
+        interactive: bool,
     },
 
     GetWorkspaceConfigForWorkspace {
@@ -514,6 +534,17 @@ pub enum ProviderRequest {
 
     GetProviderHealth {
         provider_id: ProviderId,
+    },
+
+    /// Probes the worker's configured ACP harness binary (discovery,
+    /// `initialize`, optional `authenticate`/`session/new` model catalog
+    /// discovery, and policy disclosures). Requires operator authority plus
+    /// `acp_agent_sessions` and `configure_providers`; never accepts a
+    /// client-supplied command line and never reads or returns any credential.
+    ProbeAcpHarness {
+        harness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_method: Option<String>,
     },
 }
 

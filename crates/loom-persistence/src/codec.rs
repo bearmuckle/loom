@@ -451,6 +451,16 @@ pub(crate) fn persistence_error(message: String, retryable: bool) -> LoomError {
     LoomError::new(ErrorCode::Persistence, message, retryable)
 }
 
+pub(crate) fn encode_json<T: Serialize>(value: &T, field: &str) -> Result<String> {
+    serde_json::to_string(value).map_err(|error| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            format!("could not encode {field}: {error}"),
+            false,
+        )
+    })
+}
+
 pub(crate) fn decode_json<T: DeserializeOwned>(payload: &str, field: &str) -> Result<T> {
     serde_json::from_str(payload).map_err(|error| {
         LoomError::new(

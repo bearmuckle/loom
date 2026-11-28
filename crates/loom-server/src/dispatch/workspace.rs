@@ -71,6 +71,21 @@ impl InProcessConnection {
                     self.create_session_in_workspace(workspace_id, name)?,
                 ),
             )),
+            ClientRequest::Workspace(WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
+                workspace_id,
+                name,
+                harness,
+                auth_method,
+                interactive,
+            }) => Ok(ServerResponse::Session(
+                SessionResponse::AgentSessionCreated(self.create_acp_session_in_workspace(
+                    workspace_id,
+                    name,
+                    harness,
+                    auth_method,
+                    interactive,
+                )?),
+            )),
             ClientRequest::Workspace(WorkspaceRequest::GetWorkspaceConfigForWorkspace {
                 workspace_id,
             }) => Ok(ServerResponse::Workspace(

@@ -197,6 +197,7 @@ pub(super) fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomVi
             created_at: timestamp,
             updated_at: timestamp,
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         })
         .collect::<Vec<_>>();
     let mut view = LoomView::new_for_test(focus_handle);
@@ -727,6 +728,7 @@ fn session_activation_resets_projection_and_resolves_backend_ownership(cx: &mut 
             created_at: Timestamp::from_unix_millis(1),
             updated_at: Timestamp::from_unix_millis(1),
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         });
 
         assert_eq!(view.model, model);

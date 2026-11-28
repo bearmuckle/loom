@@ -760,6 +760,7 @@ fn reconnect_feed_is_indexed_bounded_and_atomic_with_catalog_writes() {
         created_at: Timestamp::from_unix_millis(10),
         updated_at: Timestamp::from_unix_millis(10),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let mut manager = SessionManager::default();
     manager
@@ -778,6 +779,7 @@ fn reconnect_feed_is_indexed_bounded_and_atomic_with_catalog_writes() {
         created_at: Timestamp::from_unix_millis(11),
         updated_at: Timestamp::from_unix_millis(11),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let sessions = manager.export_state();
     let feed = DurableFeedState {
@@ -874,6 +876,7 @@ fn reconnect_feed_is_indexed_bounded_and_atomic_with_catalog_writes() {
                         created_at: Timestamp::from_unix_millis(11),
                         updated_at: Timestamp::from_unix_millis(11),
                         title_source: loom_core::SessionTitleSource::Auto,
+                        backend: None,
                     },
                 },
             },
@@ -950,6 +953,7 @@ fn workspace_reconnect_feed_is_isolated_indexed_and_tracks_pruning() {
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let event = |sequence, id, workspace_id| ServerEventEnvelope {
         protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
@@ -1186,6 +1190,7 @@ fn incremental_feed_rows_resolve_each_session_workspace_and_reject_unknown_sessi
                     created_at: Timestamp::from_unix_millis(1),
                     updated_at: Timestamp::from_unix_millis(1),
                     title_source: loom_core::SessionTitleSource::Auto,
+                    backend: None,
                 },
             },
         }

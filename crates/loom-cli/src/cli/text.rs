@@ -306,6 +306,10 @@ pub(crate) fn render(event: &ServerEvent, budget: usize) -> Rendered {
         }
         ServerEvent::AgentSessionArchived { .. } => body("session_archived", []),
         ServerEvent::AgentSessionRestored { .. } => body("session_restored", []),
+        ServerEvent::AgentSessionBackendUpdated { backend, .. } => body(
+            "session_backend_updated",
+            [backend.harness_name().unwrap_or("native").to_owned()],
+        ),
         ServerEvent::Agent { event } => render_agent(event, budget),
         ServerEvent::ProjectAgentCreated { agent } => {
             let parent = agent.parent_session_id.map(|parent| parent.to_string());
@@ -682,6 +686,7 @@ pub(crate) const fn server_event_name(event: &ServerEvent) -> &'static str {
         ServerEvent::AgentSessionTitleSourceChanged { .. } => "agent_session_title_source_changed",
         ServerEvent::AgentSessionArchived { .. } => "agent_session_archived",
         ServerEvent::AgentSessionRestored { .. } => "agent_session_restored",
+        ServerEvent::AgentSessionBackendUpdated { .. } => "agent_session_backend_updated",
         ServerEvent::Agent { .. } => "agent",
         ServerEvent::SessionFilesystemChanged { .. } => "session_filesystem_changed",
         ServerEvent::Terminal { .. } => "terminal",

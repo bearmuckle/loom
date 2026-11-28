@@ -4615,6 +4615,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "loom-core",
+ "loom-harness",
  "serde",
  "serde_json",
 ]
@@ -4761,6 +4762,7 @@ dependencies = [
  "loom-build",
  "loom-context",
  "loom-core",
+ "loom-harness",
  "loom-model",
  "loom-persistence",
  "loom-process",

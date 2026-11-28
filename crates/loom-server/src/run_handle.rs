@@ -1,5 +1,25 @@
 use super::*;
 
+pub(crate) struct RuntimeGuard<'a>(MutexGuard<'a, Option<AgentRuntime>>);
+
+impl std::ops::Deref for RuntimeGuard<'_> {
+    type Target = AgentRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("RuntimeGuard only wraps populated native runtimes")
+    }
+}
+
+impl std::ops::DerefMut for RuntimeGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+            .as_mut()
+            .expect("RuntimeGuard only wraps populated native runtimes")
+    }
+}
+
 impl RunHandle {
     pub(crate) fn new(runtime: AgentRuntime) -> Self {
         let initial_state = runtime.export_state();
@@ -13,6 +33,7 @@ impl RunHandle {
         Self {
             run_id: runtime.run_id(),
             session_id: runtime.session_id(),
+            is_acp: false,
             control: runtime.control(),
             state: Mutex::new(initial_state),
             message_fragments: Mutex::new(MessageFragmentState::default()),
@@ -20,7 +41,35 @@ impl RunHandle {
             message_checkpoint: Mutex::new(message_checkpoint),
             event_gate: Mutex::new(()),
             fragment_wake: Condvar::new(),
-            runtime: Mutex::new(runtime),
+            runtime: Mutex::new(Some(runtime)),
+            running: Mutex::new(false),
+            idle: Condvar::new(),
+            failure: Mutex::new(None),
+            worker: Mutex::new(None),
+            pending_model: Mutex::new(None),
+            pending_provider: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn new_acp(initial_state: AgentRuntimeState) -> Self {
+        let run_id = initial_state.run.id;
+        let session_id = initial_state.session_id;
+        let message_checkpoint = MessageCheckpointCursor {
+            attempt_id: initial_state.run.attempt_id,
+            message_count: 0,
+        };
+        Self {
+            run_id,
+            session_id,
+            is_acp: true,
+            control: RunControl::new(),
+            state: Mutex::new(initial_state),
+            message_fragments: Mutex::new(MessageFragmentState::default()),
+            activity_deltas: Mutex::new(PendingActivityDeltas::default()),
+            message_checkpoint: Mutex::new(message_checkpoint),
+            event_gate: Mutex::new(()),
+            fragment_wake: Condvar::new(),
+            runtime: Mutex::new(None),
             running: Mutex::new(false),
             idle: Condvar::new(),
             failure: Mutex::new(None),
@@ -521,21 +570,30 @@ impl RunHandle {
     ///
     /// Returns a retryable conflict instead of blocking when a step is in
     /// flight, so a caller is never parked behind a model call.
-    pub(crate) fn try_runtime(&self) -> Result<MutexGuard<'_, AgentRuntime>> {
-        match self.runtime.try_lock() {
-            Ok(runtime) => Ok(runtime),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => Err(LoomError::new(
-                ErrorCode::Conflict,
-                format!("agent run {} is executing a step", self.run_id),
-                true,
-            )),
+    pub(crate) fn try_runtime(&self) -> Result<RuntimeGuard<'_>> {
+        let guard = match self.runtime.try_lock() {
+            Ok(runtime) => runtime,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(LoomError::new(
+                    ErrorCode::Conflict,
+                    format!("agent run {} is executing a step", self.run_id),
+                    true,
+                ));
+            }
+        };
+        if guard.is_none() {
+            return Err(LoomError::invalid_state(format!(
+                "agent run {} is backed by an ACP harness rather than Loom's native runtime",
+                self.run_id
+            )));
         }
+        Ok(RuntimeGuard(guard))
     }
 
     /// Locks the runtime for an operation that responds to a state the run has
     /// already reached, allowing the worker a moment to finish its last step.
-    pub(crate) fn runtime_for_entry(&self) -> Result<MutexGuard<'_, AgentRuntime>> {
+    pub(crate) fn runtime_for_entry(&self) -> Result<RuntimeGuard<'_>> {
         // Approval events are journaled before the worker releases the runtime
         // lock. Give that transition the same settle time as other control
         // operations so a client can approve as soon as the prompt appears.

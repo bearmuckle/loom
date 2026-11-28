@@ -637,6 +637,10 @@ impl InProcessConnection {
             ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: requested_workspace,
                 ..
+            })
+            | ClientRequest::Workspace(WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
+                workspace_id: requested_workspace,
+                ..
             }) => {
                 if auth.scope().sessions.is_some() {
                     return Err(LoomError::new(
@@ -1015,6 +1019,15 @@ impl InProcessConnection {
             | ClientRequest::Provider(ProviderRequest::GetGitHubRepositoryAccess)
             | ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { .. })
             | ClientRequest::Provider(ProviderRequest::GetProviderHealth { .. }) => {}
+            ClientRequest::Provider(ProviderRequest::ProbeAcpHarness { .. }) => {
+                if auth.scope().sessions.is_some() || auth.scope().workspaces.is_some() {
+                    return Err(LoomError::new(
+                        ErrorCode::AuthorizationDenied,
+                        "probing an ACP harness requires an unrestricted operator token",
+                        false,
+                    ));
+                }
+            }
             ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
             | ClientRequest::Provider(ProviderRequest::RemoveApiKeyProvider { .. })
@@ -1289,6 +1302,7 @@ impl InProcessConnection {
                     | ProviderRequest::GetGitHubRepositoryLoginStatus { .. }
                     | ProviderRequest::ConfigureGitHubWriteAccess { .. }
                     | ProviderRequest::DiscoverProviderModels { .. }
+                    | ProviderRequest::ProbeAcpHarness { .. }
             )
         )
     }

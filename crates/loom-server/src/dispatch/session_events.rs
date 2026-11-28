@@ -428,6 +428,7 @@ fn session_lifecycle_event(event: &ServerEvent) -> bool {
             | ServerEvent::AgentSessionTitleSourceChanged { .. }
             | ServerEvent::AgentSessionArchived { .. }
             | ServerEvent::AgentSessionRestored { .. }
+            | ServerEvent::AgentSessionBackendUpdated { .. }
             | ServerEvent::ProjectAgentCreated { .. }
             | ServerEvent::ProjectAgentUpdated { .. }
             | ServerEvent::ProjectTaskUpdated { .. }

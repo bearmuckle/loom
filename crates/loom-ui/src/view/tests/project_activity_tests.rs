@@ -28,6 +28,7 @@ fn session(
         created_at: timestamp,
         updated_at: timestamp,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     }
 }
 

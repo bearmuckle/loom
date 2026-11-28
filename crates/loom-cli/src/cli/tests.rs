@@ -5839,6 +5839,7 @@ fn active_run_projection(
             created_at: synthetic_time(),
             updated_at: synthetic_time(),
             title_source: Default::default(),
+            backend: None,
         },
         active_run: Some(AgentRunSnapshotProjection {
             run: AgentRunSnapshot {
@@ -10138,6 +10139,7 @@ impl SyntheticProject {
             created_at: synthetic_time(),
             updated_at: synthetic_time(),
             title_source: Default::default(),
+            backend: None,
         }
     }
 

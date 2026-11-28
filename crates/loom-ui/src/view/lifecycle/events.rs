@@ -378,6 +378,21 @@ impl LoomView {
                     self.sync_session_state(AgentSessionState::Idle);
                 }
             }
+            ServerEvent::AgentSessionBackendUpdated {
+                session_id,
+                backend,
+            } => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == *session_id)
+                {
+                    session.backend = Some(backend.clone());
+                }
+                if self.active_session.id == *session_id {
+                    self.active_session.backend = Some(backend.clone());
+                }
+            }
             ServerEvent::Agent { event } => self.consume_agent_event(event),
             ServerEvent::SessionFilesystemChanged { change } => {
                 self.record_status(format!("Workspace {:?}: {}", change.kind, change.path));
@@ -501,6 +516,21 @@ impl LoomView {
                 // row was dropped when it was archived, so the catalog is read
                 // again rather than guessed at.
                 ServerEvent::AgentSessionRestored { .. } => reload = true,
+                ServerEvent::AgentSessionBackendUpdated {
+                    session_id,
+                    backend,
+                } => {
+                    if let Some(session) = self
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.id == session_id)
+                    {
+                        session.backend = Some(backend.clone());
+                    }
+                    if self.active_session.id == session_id {
+                        self.active_session.backend = Some(backend);
+                    }
+                }
                 ServerEvent::ProjectAgentCreated { agent }
                 | ServerEvent::ProjectAgentUpdated { agent } => {
                     self.invalidate_project_snapshot(agent.project_id);

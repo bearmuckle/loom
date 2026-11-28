@@ -1,13 +1,23 @@
 [package]
 name = "loom-harness"
-description = "Drives external agent harnesses, starting with the Claude Code CLI, as run backends."
+description = "Drives external agent harnesses (Claude Code CLI and ACP v1 harnesses) as run backends."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[features]
+test-support = []
+
+[[test]]
+name = "acp_host"
+harness = false
 
 [dependencies]
 loom-core.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+loom-harness = { path = ".", features = ["test-support"] }

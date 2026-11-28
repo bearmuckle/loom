@@ -942,3 +942,26 @@ whether or not it has a run of its own: another person's run arrives there and
 nowhere else. That follow poll may be slower than the poll of a run this
 client started, because nothing is streaming yet, but it keeps running while a
 shared session is open.
+
+## ACP harness sessions (`acp_agent_sessions`)
+
+Loom's client↔server wire protocol remains Loom's own envelopes and
+capabilities; Agent Client Protocol (ACP v1) stays inside the worker.
+
+- **Capability gating**: Creating or probing ACP sessions, and starting runs on
+  an ACP session, requires negotiating `Capability::AcpAgentSessions`
+  (`"acp_agent_sessions"`). Older clients and workers that do not negotiate it
+  refuse ACP sessions with `CapabilityDenied` rather than assuming native
+  durability or policy semantics.
+- **Session backend descriptor**: `AgentSessionSnapshot.backend` carries an
+  additive `Option<SessionBackendDescriptor>` (`None` for native sessions). For
+  ACP sessions it names the harness (e.g. `"antigravity"`), command, negotiated
+  protocol version, selected auth method, agent identity, advertised
+  `AcpCapabilities` (`load_session`, `resume_session`, `auth_methods`, etc.),
+  harness `remote_session_id`, and `available_models` from the harness catalog.
+  Updates emit `ServerEvent::AgentSessionBackendUpdated`.
+- **Requests**:
+  - `Workspace/CreateAcpAgentSessionInWorkspace { workspace_id, name, harness, auth_method?, interactive }` (requires `AcpAgentSessions` + `CreateAgentSession`, workspace-authorized; harness command is configured strictly on the worker side, never over the wire)
+  - `Provider/ProbeAcpHarness { harness, auth_method? }` → `Provider/AcpHarnessProbe` (requires unrestricted operator scope + `AcpAgentSessions` + `ConfigureProviders`)
+- See [antigravity-acp.md](antigravity-acp.md) for Antigravity (`agy acp`)
+  setup, auth methods, interactive-only enforcement, and policy disclosures.

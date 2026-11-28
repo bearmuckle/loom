@@ -279,6 +279,7 @@ fn event_json_round_trip_preserves_sequence_and_session() {
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let event = ServerEventEnvelope {
         protocol_version: ProtocolVersion::new(1, 0),
@@ -663,6 +664,7 @@ fn archived_session_restore_contract_round_trips() {
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(2),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
@@ -720,6 +722,7 @@ fn session_goal_contract_carries_a_durable_text_field() {
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),

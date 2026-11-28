@@ -158,6 +158,10 @@ impl InProcessConnection {
                     self.backend.providers.check_health(&provider_id)?,
                 )))
             }
+            ClientRequest::Provider(ProviderRequest::ProbeAcpHarness {
+                harness,
+                auth_method,
+            }) => self.probe_acp_harness(harness, auth_method),
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }
     }

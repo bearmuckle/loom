@@ -213,7 +213,7 @@ fn migrates_a_v16_database_by_adding_the_child_model_table() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(version, DATABASE_SCHEMA_VERSION);
-    assert_eq!(DATABASE_SCHEMA_VERSION, 22);
+    assert_eq!(DATABASE_SCHEMA_VERSION, 23);
     let stored_limits: i64 = connection
         .query_row("SELECT COUNT(*) FROM provider_usage_limits", [], |row| {
             row.get(0)

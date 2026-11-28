@@ -77,6 +77,11 @@ pub enum Capability {
     /// before it is bound to a person; see the pre-login state described in
     /// `docs/protocol.md`.
     GitHubSignIn,
+    /// Allows creating, probing, and driving sessions backed by an external
+    /// Agent Client Protocol (ACP) harness such as Antigravity (`agy acp`).
+    /// Clients and workers that do not negotiate this capability refuse ACP
+    /// sessions rather than assuming native durability or policy semantics.
+    AcpAgentSessions,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -158,6 +163,20 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<CapabilitySet>("[\"git_hub_sign_in\"]").unwrap(),
+            set
+        );
+    }
+
+    #[test]
+    fn acp_agent_sessions_is_a_negotiable_capability() {
+        let set = CapabilitySet::new([Capability::AcpAgentSessions]);
+        assert!(set.contains(Capability::AcpAgentSessions));
+        assert_eq!(
+            serde_json::to_string(&Capability::AcpAgentSessions).unwrap(),
+            "\"acp_agent_sessions\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CapabilitySet>("[\"acp_agent_sessions\"]").unwrap(),
             set
         );
     }

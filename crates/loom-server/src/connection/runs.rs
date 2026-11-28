@@ -48,6 +48,15 @@ impl InProcessConnection {
                 false,
             ));
         }
+        let session = self.backend.sessions()?.get(state.session_id)?;
+        if session.is_acp() {
+            let handle = Arc::new(RunHandle::new_acp(state));
+            self.backend.runs()?.insert(run_id, Arc::clone(&handle));
+            if let Some(error) = handle.take_failure() {
+                return Err(error);
+            }
+            return Ok(handle);
+        }
         let workspace = self.backend.restore_session_filesystem(state.session_id)?;
         let provider = match self.backend.provider_for_run(
             state.session_id,
@@ -483,6 +492,31 @@ impl InProcessConnection {
                 (None, None) => {}
             }
         }
+        if session.is_acp() {
+            let has_active_acp_run = self
+                .backend
+                .runs()?
+                .values()
+                .filter(|handle| handle.session_id == session.id)
+                .any(|handle| {
+                    handle.is_running()
+                        || matches!(
+                            handle.state().run.state,
+                            AgentRunState::Planning
+                                | AgentRunState::Executing
+                                | AgentRunState::Evaluating
+                                | AgentRunState::AwaitingApproval
+                        )
+                });
+            if has_active_acp_run {
+                return Err(LoomError::new(
+                    ErrorCode::InvalidState,
+                    "ACP session already has an active run",
+                    false,
+                ));
+            }
+            return self.start_acp_run(&session, input);
+        }
         if session.state != AgentSessionState::Idle {
             // A client whose projection still shows the session's run as
             // finished sends its next direction as a new run. While the run is
@@ -856,6 +890,25 @@ impl InProcessConnection {
                 handle.snapshot(),
             )));
         }
+        if handle.is_acp {
+            if model.as_str().trim().is_empty() {
+                return Err(LoomError::invalid_request("model id must not be empty"));
+            }
+            {
+                let mut state = handle.locked_state();
+                state.run.model = model.clone();
+                state.task.model = model.clone();
+                state.run.updated_at = Timestamp::now();
+            }
+            self.backend.record_agent_event(
+                handle.session_id,
+                AgentEvent::ModelChanged { run_id, model },
+            )?;
+            self.backend.persist_state()?;
+            return Ok(ServerResponse::Run(RunResponse::AgentRun(
+                handle.snapshot(),
+            )));
+        }
         let switch = {
             let (pin, provider, input_cost_micros_per_1k, output_cost_micros_per_1k) = self
                 .backend
@@ -987,6 +1040,51 @@ impl InProcessConnection {
     /// parked continuation receives a bounded failure result and the run resumes
     /// with the direction. This lets a manager be steered while its children keep
     /// running instead of being frozen until every selected child finishes.
+    pub(crate) fn approve_agent_action(
+        &self,
+        run_id: loom_core::RunId,
+        tool_call_id: loom_core::ToolCallId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<ServerResponse> {
+        let handle = self.run_handle(run_id)?;
+        if handle.is_acp {
+            return self.resolve_acp_permission(
+                &handle,
+                attempt_id,
+                expected_control_revision,
+                tool_call_id,
+                crate::acp_host::AcpPermissionDecision::Allow,
+            );
+        }
+        self.continue_run(run_id, |run| {
+            run.approve_entry(tool_call_id, attempt_id, expected_control_revision)
+        })
+    }
+
+    pub(crate) fn reject_agent_action(
+        &self,
+        run_id: loom_core::RunId,
+        tool_call_id: loom_core::ToolCallId,
+        reason: Option<String>,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<ServerResponse> {
+        let handle = self.run_handle(run_id)?;
+        if handle.is_acp {
+            return self.resolve_acp_permission(
+                &handle,
+                attempt_id,
+                expected_control_revision,
+                tool_call_id,
+                crate::acp_host::AcpPermissionDecision::Deny { reason },
+            );
+        }
+        self.continue_run(run_id, |run| {
+            run.reject_entry(tool_call_id, reason, attempt_id, expected_control_revision)
+        })
+    }
+
     pub(crate) fn send_agent_message(
         &self,
         run_id: loom_core::RunId,
@@ -995,6 +1093,9 @@ impl InProcessConnection {
         message: String,
     ) -> Result<ServerResponse> {
         let handle = self.run_handle(run_id)?;
+        if handle.is_acp {
+            return self.send_acp_message(&handle, attempt_id, expected_control_revision, message);
+        }
         let state = handle.state();
         if state.pending_project_join.is_none() {
             let active = handle.is_running()
@@ -1201,6 +1302,19 @@ impl InProcessConnection {
         stop: RunStop,
     ) -> Result<ServerResponse> {
         let handle = self.run_handle(run_id)?;
+        if handle.is_acp {
+            if handle.is_running() {
+                self.backend.acp_sessions.cancel_pending_permission(run_id);
+                handle.control.request_interrupt();
+                handle.wait_until_idle()?;
+                if let Some(error) = handle.take_failure() {
+                    return Err(error);
+                }
+            }
+            return Ok(ServerResponse::Run(RunResponse::AgentRun(
+                handle.snapshot(),
+            )));
+        }
         if handle.is_running() {
             match stop {
                 RunStop::Interrupt => handle.control.request_interrupt(),

@@ -375,6 +375,7 @@ const SHARED_NEGOTIATION_CAPABILITIES: &[Capability] = &[
     // sign-in even when it does. A worker that disables sign-in still reports
     // the refusal when a sign-in starts.
     Capability::GitHubSignIn,
+    Capability::AcpAgentSessions,
     Capability::ConfigureApprovalPolicy,
     Capability::ReadVcsStatus,
     Capability::ReadVcsDiff,

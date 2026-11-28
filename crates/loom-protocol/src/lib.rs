@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use loom_core::{
+    ANTIGRAVITY_AUTH_GEMINI_API_KEY, ANTIGRAVITY_AUTH_OAUTH_PERSONAL, ANTIGRAVITY_HARNESS_ID,
+    ANTIGRAVITY_INTERACTIONS_NOTICE, ANTIGRAVITY_TERMS_RISK_NOTICE,
+    ANTIGRAVITY_UNREGISTERED_CLIENT_NOTICE, AcpCapabilities, AcpModelCatalogEntry,
+    AcpSessionBackend, SessionBackendDescriptor,
+};
+pub use loom_core::{
     AccessRequestDecision, AccessRequestId, CredentialId, GitHubSignInStatus,
     MAX_ACCESS_REQUEST_NOTE_BYTES, ParticipantId, ParticipantIdentity, PresenceStatus,
     ProviderCredentialMetadata, RosterEntry, RunCredentialPin, SessionAccessRequest,
@@ -416,6 +422,9 @@ impl ClientRequest {
             Self::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace { .. }) => {
                 Some(Capability::CreateAgentSession)
             }
+            Self::Workspace(WorkspaceRequest::CreateAcpAgentSessionInWorkspace { .. }) => {
+                Some(Capability::AcpAgentSessions)
+            }
             Self::Workspace(WorkspaceRequest::GetWorkspaceConfigForWorkspace { .. }) => {
                 Some(Capability::ReadWorkspaceConfig)
             }
@@ -598,6 +607,9 @@ impl ClientRequest {
             }
             Self::Provider(ProviderRequest::GetProviderHealth { .. }) => {
                 Some(Capability::ReadProviderHealth)
+            }
+            Self::Provider(ProviderRequest::ProbeAcpHarness { .. }) => {
+                Some(Capability::AcpAgentSessions)
             }
             Self::Usage(UsageRequest::GetRunUsage { .. }) => Some(Capability::ReadUsage),
             Self::Usage(UsageRequest::GetSessionUsage { .. }) => Some(Capability::ReadUsage),
@@ -963,6 +975,7 @@ impl ClientRequest {
                 | Self::Workspace(WorkspaceRequest::RegisterWorkspace { .. })
                 | Self::Workspace(WorkspaceRequest::RenameWorkspace { .. })
                 | Self::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace { .. })
+                | Self::Workspace(WorkspaceRequest::CreateAcpAgentSessionInWorkspace { .. })
                 | Self::Project(ProjectRequest::CreateSubProject { .. })
                 | Self::Project(ProjectRequest::SetProjectChildModels { .. })
                 | Self::Project(ProjectRequest::ControlProjectChild { .. })
@@ -1605,6 +1618,7 @@ mod run_message_protocol_tests {
                 created_at: loom_core::Timestamp::from_unix_millis(1),
                 updated_at: loom_core::Timestamp::from_unix_millis(1),
                 title_source: loom_core::SessionTitleSource::Auto,
+                backend: None,
             }),
         });
         let encoded = encode_response(&ResponseEnvelope::success(

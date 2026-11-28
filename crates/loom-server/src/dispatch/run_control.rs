@@ -56,9 +56,12 @@ impl InProcessConnection {
                 run_id,
                 control_entry(RunControlAction::Approve { tool_call_id }),
                 |connection| {
-                    connection.continue_run(run_id, |run| {
-                        run.approve_entry(tool_call_id, attempt_id, expected_control_revision)
-                    })
+                    connection.approve_agent_action(
+                        run_id,
+                        tool_call_id,
+                        attempt_id,
+                        expected_control_revision,
+                    )
                 },
             ),
             ClientRequest::Run(RunRequest::RejectAgentAction {
@@ -74,14 +77,13 @@ impl InProcessConnection {
                     reason: reason.clone(),
                 }),
                 |connection| {
-                    connection.continue_run(run_id, |run| {
-                        run.reject_entry(
-                            tool_call_id,
-                            reason,
-                            attempt_id,
-                            expected_control_revision,
-                        )
-                    })
+                    connection.reject_agent_action(
+                        run_id,
+                        tool_call_id,
+                        reason,
+                        attempt_id,
+                        expected_control_revision,
+                    )
                 },
             ),
             ClientRequest::Run(RunRequest::SendAgentMessage {

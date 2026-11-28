@@ -968,6 +968,7 @@ impl LoomView {
             // The placeholder is not a worker's session, so nothing chose its
             // name; it reads like any session written before titles existed.
             title_source: loom_core::SessionTitleSource::Auto,
+            backend: None,
         };
         let node_input_initial = options.remote().trim().to_owned();
         let node_token_initial = options.token().trim().to_owned();

@@ -281,16 +281,15 @@ impl InProcessConnection {
             PersonAction::Message(text) => {
                 self.send_agent_message(run_id, attempt_id, control_revision, text)
             }
-            PersonAction::Control(RunControlAction::Approve { tool_call_id }) => self
-                .continue_run(run_id, |run| {
-                    run.approve_entry(tool_call_id, attempt_id, control_revision)
-                }),
+            PersonAction::Control(RunControlAction::Approve { tool_call_id }) => {
+                self.approve_agent_action(run_id, tool_call_id, attempt_id, control_revision)
+            }
             PersonAction::Control(RunControlAction::Reject {
                 tool_call_id,
                 reason,
-            }) => self.continue_run(run_id, |run| {
-                run.reject_entry(tool_call_id, reason, attempt_id, control_revision)
-            }),
+            }) => {
+                self.reject_agent_action(run_id, tool_call_id, reason, attempt_id, control_revision)
+            }
             PersonAction::Control(RunControlAction::Pause) => self.stop_run(run_id, RunStop::Pause),
             PersonAction::Control(RunControlAction::Interrupt) => {
                 self.stop_run(run_id, RunStop::Interrupt)

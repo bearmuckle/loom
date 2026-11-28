@@ -192,6 +192,7 @@ fn sub_projects_record_their_parent_project_and_refuse_other_parents() {
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     persistence
         .create_sub_project(&sub_project, parent_project_id, EventSequence::new(2))
@@ -298,6 +299,7 @@ fn project_child_and_agent_messages_are_atomic_ordered_and_request_idempotent() 
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let task = DelegatedTaskRecord {
         task_id: TaskId::new(),
@@ -588,6 +590,7 @@ fn project_cancellation_cascade_intent_is_ordered_idempotent_and_removable() {
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let task = DelegatedTaskRecord {
         task_id: TaskId::new(),
@@ -700,6 +703,7 @@ fn project_task_queries_and_cancellation_cover_lifecycle_paths() {
         created_at: now,
         updated_at: now,
         title_source: loom_core::SessionTitleSource::Auto,
+        backend: None,
     };
     let task = DelegatedTaskRecord {
         task_id: TaskId::new(),
