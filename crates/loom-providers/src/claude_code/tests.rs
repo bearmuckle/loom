@@ -630,11 +630,13 @@ esac
 read first
 echo "$first" >> '{log}'
 printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s-4","tools":[]}}'
+printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_4","name":"Bash","input":{{"command":"make"}}}}]}}}}'
 printf '%s\n' '{{"type":"control_request","request_id":"r1","request":{{"subtype":"can_use_tool","tool_name":"Bash","input":{{"command":"make"}}}}}}'
 while read line; do
   echo "$line" >> '{log}'
   case "$line" in
     *'"behavior":"allow"'*)
+      printf '%s\n' '{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_4","content":"ok","is_error":false}}]}}}}'
       printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-4","usage":{{}}}}'
       exit 0;;
     *'"behavior":"deny"'*) ;;
@@ -672,6 +674,9 @@ done
     assert_eq!(call.arguments["tool"], "Bash");
     assert_eq!(call.arguments["input"], json!({"command": "make"}));
     assert_eq!(call.arguments["claude_session"], "s-4");
+    // The call the CLI asked about is kept, so the resumed turn can hold it to
+    // reporting the result of that exact call.
+    assert_eq!(call.arguments["claude_tool_use"], "toolu_4");
     assert_eq!(
         sink.events.last(),
         Some(&ModelStreamEvent::Completed {
@@ -765,6 +770,165 @@ done
     assert!(
         prompt.contains("[User] build it") && prompt.contains("declined Bash"),
         "{prompt}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An approval the CLI answers but never runs used to complete the turn with
+/// only the bare `approved` answer in the transcript, so the caller could not
+/// tell that the call never executed. It must fail the turn, naming the call.
+#[cfg(unix)]
+#[test]
+fn an_approved_call_the_cli_never_runs_is_an_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("loom-claude-unrun-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("claude");
+    // The CLI asks about the command and, once allowed, ends its turn: no
+    // result is ever reported for the call the person approved.
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+read first
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-5","tools":[]}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_5","name":"Bash","input":{"command":"make"}}]}}'
+printf '%s\n' '{"type":"control_request","request_id":"r5","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"make"}}}'
+while read line; do
+  case "$line" in
+    *'"behavior":"allow"'*)
+      printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"finished"}}}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"finished","session_id":"s-5","usage":{}}'
+      exit 0;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), &script);
+    provider.bind_workspace(&dir);
+    let user = message(MessageRole::User, "build it");
+    let mut sink = loom_model::CollectingSink::default();
+    provider
+        .stream(
+            &request(vec![user.clone()]),
+            &CancellationToken::default(),
+            &mut sink,
+        )
+        .unwrap();
+    let call = sink
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ModelStreamEvent::ToolCallDelta { call } => Some(call.clone()),
+            _ => None,
+        })
+        .expect("the turn asks for approval");
+
+    // The person approves, and the resumed CLI answers in place.
+    let mut asked = message(MessageRole::Assistant, "");
+    asked.tool_calls = vec![call.clone()];
+    let mut answer = message(MessageRole::Tool, CLAUDE_CODE_PERMISSION_APPROVED);
+    answer.name = Some(CLAUDE_CODE_PERMISSION_TOOL.to_owned());
+    answer.tool_call_id = Some(call.id);
+    let history = vec![user, asked, answer];
+
+    let mut sink = loom_model::CollectingSink::default();
+    let error = provider
+        .stream(&request(history), &CancellationToken::default(), &mut sink)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ProviderUnavailable);
+    assert!(
+        error.message.contains("approved Bash: make"),
+        "the error names the call that never ran: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("no execution result"),
+        "{}",
+        error.message
+    );
+    assert!(
+        !sink
+            .events
+            .iter()
+            .any(|event| matches!(event, ModelStreamEvent::Completed { .. })),
+        "a turn whose approval ran nothing never completes: {:?}",
+        sink.events
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_approved_call_the_cli_refuses_itself_still_answers_the_caller() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("loom-claude-refused-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("claude");
+    // The CLI asks, is allowed, and then refuses the call on its own, which it
+    // reports as an outcome rather than leaving the approval unanswered.
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+read first
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-6","tools":[]}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_6","name":"Bash","input":{"command":"make"}}]}}'
+printf '%s\n' '{"type":"control_request","request_id":"r6","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"make"}}}'
+while read line; do
+  case "$line" in
+    *'"behavior":"allow"'*)
+      printf '%s\n' '{"type":"system","subtype":"permission_denied","tool_use_id":"toolu_6","tool_name":"Bash","message":"denied by settings"}'
+      printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"not allowed"}}}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"not allowed","session_id":"s-6","usage":{}}'
+      exit 0;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), &script);
+    provider.bind_workspace(&dir);
+    let user = message(MessageRole::User, "build it");
+    let mut sink = loom_model::CollectingSink::default();
+    provider
+        .stream(
+            &request(vec![user.clone()]),
+            &CancellationToken::default(),
+            &mut sink,
+        )
+        .unwrap();
+    let call = sink
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ModelStreamEvent::ToolCallDelta { call } => Some(call.clone()),
+            _ => None,
+        })
+        .expect("the turn asks for approval");
+
+    let mut asked = message(MessageRole::Assistant, "");
+    asked.tool_calls = vec![call.clone()];
+    let mut answer = message(MessageRole::Tool, CLAUDE_CODE_PERMISSION_APPROVED);
+    answer.name = Some(CLAUDE_CODE_PERMISSION_TOOL.to_owned());
+    answer.tool_call_id = Some(call.id);
+    let history = vec![user, asked, answer];
+
+    let mut sink = loom_model::CollectingSink::default();
+    provider
+        .stream(&request(history), &CancellationToken::default(), &mut sink)
+        .unwrap();
+    assert_eq!(
+        sink.events.last(),
+        Some(&ModelStreamEvent::Completed {
+            reason: FinishReason::Stop
+        }),
+        "the CLI's own refusal is the answer, so the turn completes"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

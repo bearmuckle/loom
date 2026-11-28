@@ -143,10 +143,12 @@ fn a_claude_tool_waits_for_approval_in_the_loom_prompt() {
         r#"#!/bin/sh
 read first
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-2","tools":[]}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"make"}}]}}'
 printf '%s\n' '{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"make"}}}'
 while read line; do
   case "$line" in
     *'"behavior":"allow"'*)
+      printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","is_error":false}]}}'
       printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"built"}}}'
       printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"built","session_id":"s-2","usage":{}}'
       exit 0;;

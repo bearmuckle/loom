@@ -23,10 +23,15 @@
 //! retry, and allows exactly that tool input: a decision lives in the
 //! transcript. Edits inside the working directory and read-only commands never
 //! ask.
+//!
+//! An approval the CLI then runs nothing for is an error, not a result: the
+//! turn fails with the approved call named, instead of completing with the bare
+//! "approved" answer that leaves the caller unable to tell whether the call
+//! ran.
 
 mod live;
 
-use std::{path::Path, process::Command, time::Duration};
+use std::{collections::BTreeSet, path::Path, process::Command, time::Duration};
 
 use loom_model::{
     CLAUDE_CODE_PERMISSION_APPROVED, CLAUDE_CODE_PERMISSION_TOOL, UsageLimitWindow, UsageLimits,
@@ -48,6 +53,9 @@ const POLL: Duration = Duration::from_millis(200);
 const SUMMARY_BYTES: usize = 160;
 /// The permission call argument that keeps the CLI's session id.
 const CLAUDE_SESSION_ARGUMENT: &str = "claude_session";
+/// The permission call argument that keeps the id of the CLI's own call, so the
+/// result it reports after an approval is matched to that approval.
+const CLAUDE_TOOL_USE_ARGUMENT: &str = "claude_tool_use";
 
 pub struct ClaudeCodeProvider {
     descriptor: ModelDescriptor,
@@ -192,6 +200,7 @@ impl ClaudeCodeProvider {
         request: &ModelRequest,
         sink: &mut dyn ModelStreamSink,
         (tool, input): (String, serde_json::Value),
+        tool_use_id: Option<String>,
     ) -> Result<()> {
         let summary = tool_summary(&tool, &input);
         let mut arguments = serde_json::json!({
@@ -204,6 +213,11 @@ impl ClaudeCodeProvider {
         // continue that conversation instead of starting one from a recap.
         if let Some(id) = &self.claude_session {
             arguments[CLAUDE_SESSION_ARGUMENT] = serde_json::Value::String(id.clone());
+        }
+        // The call this approval is about, when this turn saw the CLI make it,
+        // so the resume can hold the CLI to reporting its result.
+        if let Some(id) = tool_use_id {
+            arguments[CLAUDE_TOOL_USE_ARGUMENT] = serde_json::Value::String(id);
         }
         emit(
             sink,
@@ -350,6 +364,8 @@ impl ClaudeCodeProvider {
 struct Decided {
     tool: String,
     input: serde_json::Value,
+    /// The CLI's id for the call it asked about, when the asking turn saw it.
+    tool_use_id: Option<String>,
     approved: bool,
 }
 
@@ -448,7 +464,53 @@ fn decided_at(messages: &[ModelMessage], index: usize) -> Option<Decided> {
             .get("input")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        tool_use_id: call
+            .arguments
+            .get(CLAUDE_TOOL_USE_ARGUMENT)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         approved: answer.content.trim() == CLAUDE_CODE_PERMISSION_APPROVED,
+    })
+}
+
+/// The approvals this turn delivers to the CLI.
+///
+/// A permission decision recorded after the last reply is an approval the run
+/// has not executed: the CLI is told to run that exact call now, so the turn
+/// owes its result.
+fn approvals_to_run(messages: &[ModelMessage]) -> Vec<Decided> {
+    let start = messages
+        .iter()
+        .rposition(|message| message.role == MessageRole::Assistant)
+        .map_or(0, |index| index + 1);
+    (start..messages.len())
+        .filter_map(|index| decided_at(messages, index))
+        .filter(|decided| decided.approved)
+        .collect()
+}
+
+/// Whether the CLI reported the result of an approved call.
+///
+/// The CLI emits a call's `tool_use` before asking about it, so the approval
+/// keeps that id and the result it reports is matched to it. A CLI that repeats
+/// the call in this turn instead reports it in `reported` under a new id.
+fn ran(
+    decided: &Decided,
+    reported: &[(String, String, serde_json::Value)],
+    executed: &BTreeSet<String>,
+    refused: &BTreeSet<String>,
+) -> bool {
+    if decided
+        .tool_use_id
+        .as_ref()
+        .is_some_and(|id| executed.contains(id) || refused.contains(id))
+    {
+        return true;
+    }
+    reported.iter().any(|(id, tool, input)| {
+        *tool == decided.tool
+            && *input == decided.input
+            && (executed.contains(id) || refused.contains(id))
     })
 }
 
@@ -786,6 +848,16 @@ impl ModelProvider for ClaudeCodeProvider {
         let mut usage = TokenUsage::default();
         // The limits the CLI reported during this turn, if any.
         let mut seen_limits: Option<UsageLimits> = None;
+        // The approvals this turn hands to the CLI, and the calls the CLI
+        // reports while it runs them. An approval whose call produces no result
+        // must fail the turn: completing it would answer the caller with the
+        // bare "approved" and no sign that the call never ran.
+        let awaiting = approvals_to_run(&request.messages);
+        let mut reported: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut executed: BTreeSet<String> = BTreeSet::new();
+        // The calls the CLI talked itself out of after the approval reached it,
+        // which answers the caller instead of leaving it with "approved".
+        let mut refused: BTreeSet<String> = BTreeSet::new();
         loop {
             if !stopping && cancel.is_cancelled() {
                 stopping = true;
@@ -857,6 +929,7 @@ impl ModelProvider for ClaudeCodeProvider {
                 ClaudeEvent::TextDelta { .. } => StreamFlow::Continue,
                 ClaudeEvent::ThinkingDelta { text, .. } => emit(sink, reasoning(text))?,
                 ClaudeEvent::ToolUse {
+                    id,
                     name,
                     input,
                     parent_tool_use_id,
@@ -865,13 +938,22 @@ impl ModelProvider for ClaudeCodeProvider {
                     if parent_tool_use_id.is_none() {
                         reply.tool_call();
                     }
+                    reported.push((id, name.clone(), input.clone()));
                     emit(sink, reasoning(tool_summary(&name, &input)))?
                 }
                 ClaudeEvent::ToolResult {
+                    tool_use_id,
                     content,
-                    is_error: true,
+                    is_error,
                     ..
-                } => emit(sink, reasoning(format!("  ✗ {}\n", shorten(&content))))?,
+                } => {
+                    executed.insert(tool_use_id);
+                    if is_error {
+                        emit(sink, reasoning(format!("  ✗ {}\n", shorten(&content))))?
+                    } else {
+                        StreamFlow::Continue
+                    }
+                }
                 ClaudeEvent::PermissionRequest {
                     request_id,
                     tool_name,
@@ -894,7 +976,18 @@ impl ModelProvider for ClaudeCodeProvider {
                             sink,
                             reasoning(format!("  ? {tool_name} waits for approval\n")),
                         )?;
-                        self.ask_for_approval(request, sink, (tool_name.clone(), input.clone()))?;
+                        // The call this turn saw, so the approval keeps its id
+                        // and the CLI is held to reporting its result.
+                        let tool_use_id = reported
+                            .last()
+                            .filter(|(_, name, seen)| *name == tool_name && *seen == input)
+                            .map(|(id, _, _)| id.clone());
+                        self.ask_for_approval(
+                            request,
+                            sink,
+                            (tool_name.clone(), input.clone()),
+                            tool_use_id,
+                        )?;
                         live.queued = queued;
                         self.keep(
                             key,
@@ -909,10 +1002,19 @@ impl ModelProvider for ClaudeCodeProvider {
                         return Ok(());
                     }
                 }
-                ClaudeEvent::PermissionDenied { tool_name, .. } => emit(
-                    sink,
-                    reasoning(format!("  ✗ {tool_name} was not allowed\n")),
-                )?,
+                ClaudeEvent::PermissionDenied {
+                    tool_use_id,
+                    tool_name,
+                    ..
+                } => {
+                    if let Some(id) = tool_use_id {
+                        refused.insert(id);
+                    }
+                    emit(
+                        sink,
+                        reasoning(format!("  ✗ {tool_name} was not allowed\n")),
+                    )?
+                }
                 ClaudeEvent::Result(summary) => {
                     if summary.is_error {
                         self.keep(key, live, request, None);
@@ -938,6 +1040,26 @@ impl ModelProvider for ClaudeCodeProvider {
                         live.session.send_user_message(&next)?;
                         reply.tool_call();
                         continue;
+                    }
+                    if let Some(unrun) = awaiting
+                        .iter()
+                        .find(|decided| !ran(decided, &reported, &executed, &refused))
+                    {
+                        // The approval reached the CLI, which then ended its
+                        // turn without running the call. Completing here would
+                        // leave the caller with the bare "approved" and no way
+                        // to tell that nothing ran, so fail the turn instead.
+                        let message = format!(
+                            "Claude Code approved {} but reported no execution result: the \
+                             approved call did not run",
+                            call_label(&unrun.tool, &unrun.input)
+                        );
+                        self.keep(key, live, request, None);
+                        return Err(LoomError::new(
+                            ErrorCode::ProviderUnavailable,
+                            message,
+                            false,
+                        ));
                     }
                     if reply.is_empty() {
                         // Nothing reached the stream, so the turn would end with
@@ -1012,9 +1134,9 @@ impl ModelProvider for ClaudeCodeProvider {
                     }
                     StreamFlow::Continue
                 }
-                ClaudeEvent::PermissionCancelled { .. }
-                | ClaudeEvent::ToolResult { .. }
-                | ClaudeEvent::Other { .. } => StreamFlow::Continue,
+                ClaudeEvent::PermissionCancelled { .. } | ClaudeEvent::Other { .. } => {
+                    StreamFlow::Continue
+                }
             };
             if flow == StreamFlow::Stop {
                 let _ = live.session.interrupt();
