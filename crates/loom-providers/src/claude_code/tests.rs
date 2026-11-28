@@ -826,6 +826,24 @@ done
         "{seen}"
     );
 
+    // The runtime may replace older history with a summary; the process still
+    // serves the transcript and is sent only the new message.
+    turn(vec![
+        message(
+            MessageRole::User,
+            "Earlier conversation (lossy excerpts): first",
+        ),
+        message(MessageRole::User, "second"),
+        message(MessageRole::Assistant, "ok"),
+        message(MessageRole::User, "third"),
+    ]);
+    assert_eq!(launches(), 1);
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        seen.contains("third") && !seen.contains("lossy excerpts"),
+        "{seen}"
+    );
+
     // A transcript the process has not seen gets a process of its own.
     turn(vec![message(MessageRole::User, "elsewhere")]);
     assert_eq!(launches(), 2);

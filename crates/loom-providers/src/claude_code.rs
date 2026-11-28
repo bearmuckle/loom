@@ -255,8 +255,7 @@ impl ClaudeCodeProvider {
     ) {
         let messages = &request.messages;
         live.claude_session = self.claude_session.clone();
-        live.delivered = self.delivered;
-        live.seen = live::digest(&messages[..self.delivered.min(messages.len())]);
+        live.anchor = live::Anchor::of(messages, self.delivered);
         live.pending = pending;
         live::put(key, live);
     }
@@ -674,7 +673,16 @@ impl ModelProvider for ClaudeCodeProvider {
         let approved = approved_inputs(&request.messages);
         let key = self.pool_key(&cwd);
         let launch = self.launch(&cwd);
-        let kept = live::take(&key).filter(|live| live.fits(&launch, &request.messages));
+        let kept = live::take(&key).and_then(|live| {
+            let delivered = live.fits(&launch, &request.messages);
+            if delivered.is_none() {
+                log::info!(
+                    "[claude-code] the kept process does not match this transcript; starting a \
+                     new one"
+                );
+            }
+            Some((live, delivered?))
+        });
         let reused = kept.is_some();
         // What this provider knew before adopting a kept process; a retry after
         // that process turns out dead starts from it again.
@@ -682,9 +690,9 @@ impl ModelProvider for ClaudeCodeProvider {
         // The first thing the process is told, and the user messages that wait
         // for the end of its turn.
         let (mut live, opening, mut queued) = match kept {
-            Some(mut live) => {
+            Some((mut live, delivered)) => {
                 self.claude_session = live.claude_session.clone();
-                self.delivered = live.delivered;
+                self.delivered = delivered;
                 let mut queued = std::mem::take(&mut live.queued);
                 match live.pending.take() {
                     Some(pending) => {

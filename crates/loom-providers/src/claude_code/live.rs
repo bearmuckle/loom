@@ -38,10 +38,9 @@ pub(super) struct Live {
     /// What the process was started with; a change needs a new process.
     pub launch: String,
     pub claude_session: Option<String>,
-    pub delivered: usize,
-    /// The user messages the process has seen, so a transcript it does not
+    /// Where the process stands in the transcript, so a transcript it does not
     /// belong to never takes it.
-    pub seen: u64,
+    pub anchor: Anchor,
     pub pending: Option<Pending>,
     /// User messages that arrived while a call waited and still need sending
     /// once the CLI finishes its turn.
@@ -55,19 +54,20 @@ impl Live {
             session,
             launch,
             claude_session: None,
-            delivered: 0,
-            seen: 0,
+            anchor: Anchor::default(),
             pending: None,
             queued: Vec::new(),
             used: Instant::now(),
         }
     }
 
-    /// Whether this process can serve a transcript of `messages`.
-    pub fn fits(&self, launch: &str, messages: &[ModelMessage]) -> bool {
-        self.launch == launch
-            && self.delivered <= messages.len() + 1
-            && self.seen == digest(&messages[..self.delivered.min(messages.len())])
+    /// How many messages of `messages` this process has read, when it can
+    /// serve that transcript.
+    pub fn fits(&self, launch: &str, messages: &[ModelMessage]) -> Option<usize> {
+        if self.launch != launch {
+            return None;
+        }
+        self.anchor.locate(messages)
     }
 
     fn expired(&self, now: Instant) -> bool {
@@ -80,14 +80,82 @@ impl Live {
     }
 }
 
-/// A digest of the user messages in `messages`.
-pub(super) fn digest(messages: &[ModelMessage]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for message in messages {
-        if message.role == MessageRole::User {
-            message.content.hash(&mut hasher);
+/// How many user and tool messages mark a process's place in a transcript.
+const ANCHOR_LEN: usize = 3;
+
+/// A process's place in a transcript.
+///
+/// The runtime may replace older history with a summary that changes from
+/// turn to turn, so positions and the transcript's start do not stay put. The
+/// most recent user and tool messages are kept verbatim, so the place is the
+/// last few of those the process read, and how far past the last one it got.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Anchor {
+    marks: Vec<u64>,
+    offset: usize,
+}
+
+impl Anchor {
+    /// The place of a process that has read the first `delivered` messages.
+    pub fn of(messages: &[ModelMessage], delivered: usize) -> Self {
+        let read = &messages[..delivered.min(messages.len())];
+        let marked = marked(read);
+        let tail = &marked[marked.len().saturating_sub(ANCHOR_LEN)..];
+        match tail.last() {
+            Some(&last) => Self {
+                marks: tail.iter().map(|&index| mark(&messages[index])).collect(),
+                offset: delivered - last,
+            },
+            None => Self {
+                marks: Vec::new(),
+                offset: delivered,
+            },
         }
     }
+
+    /// How many messages of `messages` a process at this place has read, when
+    /// the transcript still holds its place.
+    pub fn locate(&self, messages: &[ModelMessage]) -> Option<usize> {
+        let delivered = if self.marks.is_empty() {
+            (marked(messages).is_empty() || self.offset == 0).then_some(self.offset)
+        } else {
+            // The latest match, since the process is near the end of the
+            // transcript. The newest mark must be there; older ones may have
+            // gone into the summary at the transcript's start, so the
+            // comparison stops there or at the first message.
+            let marked = marked(messages);
+            (0..marked.len()).rev().find_map(|end| {
+                self.marks
+                    .iter()
+                    .rev()
+                    .zip(marked[..=end].iter().rev())
+                    .enumerate()
+                    .all(|(step, (&want, &index))| {
+                        mark(&messages[index]) == want || (step > 0 && index == marked[0])
+                    })
+                    .then(|| marked[end] + self.offset)
+            })
+        }?;
+        (delivered <= messages.len() + 1).then_some(delivered)
+    }
+}
+
+/// The indices of the messages that mark a place: what the person and the
+/// tools said, which a later transcript repeats word for word.
+fn marked(messages: &[ModelMessage]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| matches!(message.role, MessageRole::User | MessageRole::Tool))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn mark(message: &ModelMessage) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    format!("{:?}", message.role).hash(&mut hasher);
+    message.content.hash(&mut hasher);
+    format!("{:?}", message.tool_call_id).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -103,7 +171,11 @@ fn locked() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Live>> {
 /// Takes the process kept for `key`, if one is still running.
 pub(super) fn take(key: &PathBuf) -> Option<Live> {
     let mut live = locked().remove(key)?;
-    (!live.session.has_exited()).then_some(live)
+    if live.session.has_exited() {
+        log::info!("[claude-code] the kept process had exited; starting a new one");
+        return None;
+    }
+    Some(live)
 }
 
 /// Keeps `live` for `key`, ending processes that waited too long.
@@ -139,4 +211,49 @@ pub(super) fn put(key: PathBuf, mut live: Live) {
         }
     }
     drop(ended);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(text: &str) -> ModelMessage {
+        ModelMessage::new(MessageRole::User, text)
+    }
+
+    fn reply(text: &str) -> ModelMessage {
+        ModelMessage::new(MessageRole::Assistant, text)
+    }
+
+    #[test]
+    fn a_place_is_found_again_after_new_messages() {
+        let read = vec![user("a"), reply("1"), user("b")];
+        let anchor = Anchor::of(&read, read.len() + 1);
+        let later = vec![user("a"), reply("1"), user("b"), reply("2"), user("c")];
+        assert_eq!(anchor.locate(&later), Some(4));
+    }
+
+    #[test]
+    fn a_place_survives_a_summary_of_older_history() {
+        let read = vec![user("a"), reply("1"), user("b"), reply("2"), user("c")];
+        let anchor = Anchor::of(&read, read.len() + 1);
+        let compacted = vec![user("summary of a and b"), user("c"), reply("3"), user("d")];
+        assert_eq!(anchor.locate(&compacted), Some(3));
+    }
+
+    #[test]
+    fn a_different_transcript_has_no_place() {
+        let read = vec![user("a"), reply("1"), user("b")];
+        let anchor = Anchor::of(&read, read.len() + 1);
+        assert_eq!(anchor.locate(&[user("x"), reply("1"), user("y")]), None);
+        assert_eq!(anchor.locate(&[user("x"), user("a"), user("b")]), Some(4));
+    }
+
+    #[test]
+    fn a_place_before_any_message_is_the_start() {
+        let anchor = Anchor::of(&[], 0);
+        assert_eq!(anchor.locate(&[user("a")]), Some(0));
+        let past = Anchor::of(&[reply("1")], 2);
+        assert_eq!(past.locate(&[user("a")]), None);
+    }
 }
