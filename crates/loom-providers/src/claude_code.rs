@@ -90,12 +90,10 @@ impl ClaudeCodeProvider {
             self.claude_session = None;
         }
         let messages = &request.messages;
+        let cwd = self.cwd.as_deref();
         if self.claude_session.is_some() {
             let news = (self.delivered.min(messages.len())..messages.len())
-                .filter_map(|index| match messages[index].role {
-                    MessageRole::User => Some(messages[index].content.clone()),
-                    _ => decided_at(messages, index).map(|decided| decided.note()),
-                })
+                .filter_map(|index| unseen_at(messages, index, cwd))
                 .collect::<Vec<_>>();
             if !news.is_empty() {
                 return (news.join("\n\n"), None);
@@ -106,65 +104,47 @@ impl ClaudeCodeProvider {
             // nothing would fail the run, so continue from the journal.
             self.claude_session = None;
         }
-        let answered = decided_at(messages, messages.len().saturating_sub(1));
-        let system = request
-            .messages
+        let system = messages
             .iter()
             .filter(|message| message.role == MessageRole::System)
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        let turns = request
-            .messages
+        // Everything after the last reply is still unanswered: the user's
+        // messages and any permission decision, in the order they came. A
+        // message typed while a call waited for approval is one of them, so it
+        // reaches the CLI next to the decision instead of hiding it.
+        let start = messages
             .iter()
-            .filter(|message| matches!(message.role, MessageRole::User | MessageRole::Assistant))
+            .rposition(|message| message.role == MessageRole::Assistant)
+            .map_or(0, |index| index + 1);
+        let latest = (start..messages.len())
+            .filter_map(|index| unseen_at(messages, index, cwd))
             .collect::<Vec<_>>();
-        let recap_of = |turns: &[&ModelMessage]| {
-            turns
-                .iter()
-                .map(|message| {
-                    let who = if message.role == MessageRole::User {
-                        "User"
-                    } else {
-                        "Assistant"
-                    };
-                    format!("[{who}] {}", message.content)
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
-        let prompt = match turns.split_last() {
-            _ if answered.is_some() => {
-                let note = answered.map(|decided| decided.note()).unwrap_or_default();
-                if turns.is_empty() {
-                    note
-                } else {
-                    format!(
-                        "This conversation has earlier messages, kept here as a transcript. \
-                         Treat it as history.\n\n{}\n\n{note}",
-                        recap_of(&turns)
-                    )
-                }
-            }
-            Some((latest, earlier)) if latest.role == MessageRole::User && !earlier.is_empty() => {
-                let recap = recap_of(earlier);
-                format!(
-                    "This conversation has earlier messages, kept here as a transcript. \
-                     Treat it as history and answer the latest message.\n\n{recap}\n\n\
-                     Latest message:\n{}",
-                    latest.content
-                )
-            }
-            Some((latest, _)) if latest.role == MessageRole::User => latest.content.clone(),
+        let recap = messages[..start]
+            .iter()
+            .filter_map(recap_line)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        const INTRO: &str = "This conversation has earlier messages, kept here as a transcript.";
+        let prompt = match (recap.is_empty(), latest.as_slice()) {
+            (_, []) if recap.is_empty() => String::new(),
             // The last kept turn is already a reply, as after a cancelled turn,
             // so the CLI is asked to carry on from it instead of being handed an
             // empty prompt.
-            Some(_) => format!(
-                "This conversation has earlier messages, kept here as a transcript. \
-                 Treat it as history and continue from where it stops.\n\n{}",
-                recap_of(&turns)
+            (false, []) => {
+                format!("{INTRO} Treat it as history and continue from where it stops.\n\n{recap}")
+            }
+            (true, latest) => latest.join("\n\n"),
+            (false, [latest]) => format!(
+                "{INTRO} Treat it as history and answer the latest message.\n\n{recap}\n\n\
+                 Latest message:\n{latest}"
             ),
-            None => String::new(),
+            (false, latest) => format!(
+                "{INTRO} Treat it as history and answer the latest messages.\n\n{recap}\n\n\
+                 Latest messages:\n{}",
+                latest.join("\n\n")
+            ),
         };
         (prompt, (!system.is_empty()).then_some(system))
     }
@@ -259,18 +239,73 @@ struct Decided {
 
 impl Decided {
     /// What the CLI is told about the decision.
-    fn note(&self) -> String {
-        if self.approved {
+    ///
+    /// The note is Loom's, not the person's words, so it says so. The CLI
+    /// starts again in `cwd` for every turn, so the note names it: a directory
+    /// an earlier command changed to is not kept.
+    fn note(&self, cwd: Option<&Path>) -> String {
+        let note = if self.approved {
             format!(
-                "The user approved {}. Run it again now with this input: {}",
+                "[Loom] The user approved {} in Loom's approval prompt. Run it again now with \
+                 this input: {}",
                 self.tool, self.input
             )
         } else {
             format!(
-                "The user declined {}. Do not run it; continue another way or say what you need.",
+                "[Loom] The user declined {} in Loom's approval prompt. Do not run it; continue \
+                 another way or say what you need.",
                 self.tool
             )
+        };
+        match cwd {
+            Some(dir) => format!("{note}\nThe working directory is {}.", dir.display()),
+            None => note,
         }
+    }
+}
+
+/// What the message at `index` tells the CLI when it has not seen it: a user
+/// message's text, or the note for a permission decision.
+fn unseen_at(messages: &[ModelMessage], index: usize, cwd: Option<&Path>) -> Option<String> {
+    let message = messages.get(index)?;
+    match message.role {
+        MessageRole::User => Some(message.content.clone()),
+        _ => decided_at(messages, index).map(|decided| decided.note(cwd)),
+    }
+}
+
+/// One message of a recap, or `None` when it carries nothing to recall.
+///
+/// An assistant turn that only called tools still says which, so the recap
+/// shows what was done instead of an empty line.
+fn recap_line(message: &ModelMessage) -> Option<String> {
+    match message.role {
+        MessageRole::User => Some(format!("[User] {}", message.content)),
+        MessageRole::Assistant => {
+            let text = message.content.trim();
+            let lines = (!text.is_empty())
+                .then(|| format!("[Assistant] {text}"))
+                .into_iter()
+                .chain(message.tool_calls.iter().map(|call| {
+                    let label = if call.name == CLAUDE_CODE_PERMISSION_TOOL {
+                        call_label(
+                            call.arguments
+                                .get("tool")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("a tool"),
+                            call.arguments
+                                .get("input")
+                                .unwrap_or(&serde_json::Value::Null),
+                        )
+                    } else {
+                        call_label(&call.name, &call.arguments)
+                    };
+                    format!("[Assistant called {label}]")
+                }))
+                .collect::<Vec<_>>();
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        }
+        _ => None,
     }
 }
 
@@ -326,15 +361,20 @@ fn shorten(text: &str) -> String {
 
 /// A short account of a tool call, for the reasoning stream.
 fn tool_summary(name: &str, input: &serde_json::Value) -> String {
+    format!("→ {}\n", call_label(name, input))
+}
+
+/// A tool's name and the one detail of its input that says what it acted on.
+fn call_label(name: &str, input: &serde_json::Value) -> String {
     let detail = ["command", "file_path", "path", "pattern", "url", "query"]
         .iter()
         .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
         .map(shorten)
         .unwrap_or_default();
     if detail.is_empty() {
-        format!("→ {name}\n")
+        name.to_owned()
     } else {
-        format!("→ {name}: {detail}\n")
+        format!("{name}: {detail}")
     }
 }
 

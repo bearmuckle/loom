@@ -212,6 +212,96 @@ fn a_fresh_conversation_with_history_gets_a_labelled_recap() {
     assert_eq!(system, None);
 }
 
+/// A parked permission call and its answer, as the runtime keeps them.
+fn decided(tool: &str, input: serde_json::Value, answer: &str) -> [ModelMessage; 2] {
+    let call = ToolCall {
+        id: ToolCallId::new(),
+        name: CLAUDE_CODE_PERMISSION_TOOL.to_owned(),
+        arguments: json!({"tool": tool, "input": input}),
+    };
+    let mut asked = message(MessageRole::Assistant, "");
+    asked.tool_calls = vec![call.clone()];
+    let mut answered = message(MessageRole::Tool, answer);
+    answered.name = Some(CLAUDE_CODE_PERMISSION_TOOL.to_owned());
+    answered.tool_call_id = Some(call.id);
+    [asked, answered]
+}
+
+#[test]
+fn a_recap_names_tool_calls_and_skips_empty_turns() {
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), "claude");
+    let mut called = message(MessageRole::Assistant, "Checking.");
+    called.tool_calls = vec![ToolCall {
+        id: ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: json!({"command": "git status"}),
+    }];
+    let [asked, answered] = decided("Bash", json!({"command": "make"}), "approved");
+    let (prompt, _) = provider.next_prompt(&request(vec![
+        message(MessageRole::User, "one"),
+        message(MessageRole::Assistant, "  "),
+        called,
+        message(MessageRole::Tool, "clean"),
+        asked,
+        answered,
+        message(MessageRole::Assistant, "Built."),
+        message(MessageRole::User, "two"),
+    ]));
+    assert!(
+        prompt.contains("[Assistant] Checking.\n[Assistant called run_command: git status]"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("[Assistant called Bash: make]"), "{prompt}");
+    assert!(
+        !prompt.contains("[Assistant] \n") && !prompt.contains("[Assistant]  "),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("clean"), "tool output stays out: {prompt}");
+    assert!(prompt.ends_with("Latest message:\ntwo"), "{prompt}");
+}
+
+#[test]
+fn a_message_typed_during_an_approval_reaches_the_cli_with_the_decision() {
+    let mut provider =
+        ClaudeCodeProvider::new(descriptor("sonnet"), "claude").with_workspace("/work/root");
+    let [asked, answered] = decided("Bash", json!({"command": "make"}), "approved");
+    let (prompt, _) = provider.next_prompt(&request(vec![
+        message(MessageRole::User, "build it"),
+        asked,
+        answered,
+        message(MessageRole::User, "status?"),
+    ]));
+    assert!(
+        prompt.contains("[User] build it\n\n[Assistant called Bash: make]"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("Latest messages:\n[Loom] The user approved Bash"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("The working directory is /work/root."),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("\n\nstatus?"), "{prompt}");
+
+    // A continued conversation hears both too, in order.
+    provider.claude_session = Some("s-1".to_owned());
+    provider.delivered = 2;
+    let [asked, answered] = decided("Bash", json!({"command": "make"}), "denied");
+    let (prompt, _) = provider.next_prompt(&request(vec![
+        message(MessageRole::User, "build it"),
+        asked,
+        answered,
+        message(MessageRole::User, "status?"),
+    ]));
+    assert!(
+        prompt.starts_with("[Loom] The user declined Bash"),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("/work/root.\n\nstatus?"), "{prompt}");
+}
+
 #[test]
 fn a_continued_conversation_sends_only_what_the_cli_has_not_seen() {
     let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), "claude");
