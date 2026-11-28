@@ -173,6 +173,8 @@ pub enum ClaudeEvent {
         model: Option<String>,
         tools: Vec<String>,
         permission_mode: Option<String>,
+        /// The directory the process was started in, as the CLI reports it.
+        cwd: Option<PathBuf>,
     },
     TextDelta {
         text: String,
@@ -338,6 +340,7 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
                     })
                     .unwrap_or_default(),
                 permission_mode: string_field(&value, "permissionMode"),
+                cwd: string_field(&value, "cwd").map(PathBuf::from),
             }],
             Some("permission_denied") => vec![ClaudeEvent::PermissionDenied {
                 tool_use_id: string_field(&value, "tool_use_id"),

@@ -214,10 +214,29 @@ fn a_fresh_conversation_with_history_gets_a_labelled_recap() {
 
 /// A parked permission call and its answer, as the runtime keeps them.
 fn decided(tool: &str, input: serde_json::Value, answer: &str) -> [ModelMessage; 2] {
+    parked_call(json!({"tool": tool, "input": input}), answer)
+}
+
+/// A parked permission call that recorded the CLI's session and the directory
+/// its shell was in.
+fn parked(
+    tool: &str,
+    input: serde_json::Value,
+    shell_cwd: Option<&str>,
+    answer: &str,
+) -> [ModelMessage; 2] {
+    let mut arguments = json!({"tool": tool, "input": input, "claude_session": "s-1"});
+    if let Some(dir) = shell_cwd {
+        arguments["shell_cwd"] = json!(dir);
+    }
+    parked_call(arguments, answer)
+}
+
+fn parked_call(arguments: serde_json::Value, answer: &str) -> [ModelMessage; 2] {
     let call = ToolCall {
         id: ToolCallId::new(),
         name: CLAUDE_CODE_PERMISSION_TOOL.to_owned(),
-        arguments: json!({"tool": tool, "input": input}),
+        arguments,
     };
     let mut asked = message(MessageRole::Assistant, "");
     asked.tool_calls = vec![call.clone()];
@@ -299,7 +318,10 @@ fn a_message_typed_during_an_approval_reaches_the_cli_with_the_decision() {
         prompt.starts_with("[Loom] The user declined Bash"),
         "{prompt}"
     );
-    assert!(prompt.ends_with("/work/root.\n\nstatus?"), "{prompt}");
+    assert!(
+        prompt.contains("/work/root.") && prompt.ends_with("\n\nstatus?"),
+        "{prompt}"
+    );
 }
 
 #[test]
@@ -396,6 +418,98 @@ fn the_registry_offers_the_provider_only_when_the_operator_names_a_binary() {
         .create_provider(&ModelId::new("claude-code:opus"))
         .unwrap();
     assert_eq!(built.descriptor().id.as_str(), "claude-code:opus");
+}
+
+#[test]
+fn only_a_plain_leading_cd_names_a_directory() {
+    assert_eq!(
+        led_directory("cd repositories/loom && gh issue view 442"),
+        Some("repositories/loom")
+    );
+    assert_eq!(led_directory("  cd /tmp; ls"), Some("/tmp"));
+    assert_eq!(led_directory("cd ../other\nls"), Some("../other"));
+    for ignored in [
+        "cd",
+        "cdrom x",
+        "cd - >/dev/null",
+        "cd \"$HOME\" && ls",
+        "cd ~/work",
+        "cd *.rs",
+        "ls && cd x",
+        "cargo cd x",
+    ] {
+        assert_eq!(led_directory(ignored), None, "{ignored}");
+    }
+}
+
+#[test]
+fn a_relative_cd_is_resolved_against_the_directory_it_started_in() {
+    assert_eq!(
+        resolve(Path::new("/work/root"), "repositories/loom"),
+        PathBuf::from("/work/root/repositories/loom")
+    );
+    assert_eq!(
+        resolve(Path::new("/work/root/repositories/loom"), "../other"),
+        PathBuf::from("/work/root/repositories/other")
+    );
+    assert_eq!(
+        resolve(Path::new("/work/root"), "/tmp/x"),
+        PathBuf::from("/tmp/x")
+    );
+}
+
+#[test]
+fn a_parked_call_is_replayed_verbatim_in_the_directory_it_asked_in() {
+    let mut provider =
+        ClaudeCodeProvider::new(descriptor("sonnet"), "claude").with_workspace("/work/root");
+    let command = "cd /work/root/repositories/loom && sed -n 440,500p crates/loom-harness/src/\
+                   claude_code.rs";
+    let [asked, answered] = parked(
+        "Bash",
+        json!({"command": command}),
+        Some("/work/root/repositories/loom"),
+        CLAUDE_CODE_PERMISSION_APPROVED,
+    );
+    let (prompt, _) = provider.next_prompt(&request(vec![
+        message(MessageRole::User, "look at the harness"),
+        asked,
+        answered,
+    ]));
+    // The input is the one that was asked about, byte for byte: the leading
+    // `cd` is part of the command and is not dropped.
+    assert!(
+        prompt.contains(&format!("this input: {{\"command\":\"{command}\"}}")),
+        "{prompt}"
+    );
+    // The directory the shell was in is stated, and the resumed CLI is started
+    // there so the call runs where it was asked.
+    assert!(
+        prompt.contains("The working directory is /work/root/repositories/loom."),
+        "{prompt}"
+    );
+    assert_eq!(provider.claude_session.as_deref(), Some("s-1"));
+    assert_eq!(
+        provider.shell_cwd.as_deref(),
+        Some(Path::new("/work/root/repositories/loom"))
+    );
+}
+
+#[test]
+fn a_parked_call_without_a_recorded_directory_falls_back_to_the_workspace() {
+    let mut provider =
+        ClaudeCodeProvider::new(descriptor("sonnet"), "claude").with_workspace("/work/root");
+    let [asked, answered] = decided("Bash", json!({"command": "make"}), "approved");
+    let (prompt, _) = provider.next_prompt(&request(vec![asked, answered]));
+    assert!(
+        prompt.contains("The working directory is /work/root."),
+        "{prompt}"
+    );
+    // A directory that is no longer there is not started in.
+    provider.shell_cwd = Some(PathBuf::from("/nonexistent/loom"));
+    assert_eq!(
+        provider.spawn_cwd(Path::new("/work/root")),
+        PathBuf::from("/work/root")
+    );
 }
 
 /// A stand-in `claude` that plays one scripted turn. One test, because a script
@@ -765,6 +879,110 @@ done
     assert!(
         prompt.contains("[User] build it") && prompt.contains("declined Bash"),
         "{prompt}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_parked_call_runs_again_in_the_directory_the_shell_moved_to() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("loom-claude-shell-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("repositories/loom")).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let log = dir.join("log.txt");
+    let count = dir.join("runs.txt");
+    let script = dir.join("claude");
+    // The first run moves its shell and then asks; the second says where it was
+    // started and what it was told.
+    let body = format!(
+        r#"#!/bin/sh
+echo "launch $*" >> '{log}'
+echo "started in $(pwd)" >> '{log}'
+read first
+echo "prompt $first" >> '{log}'
+printf '%s\n' "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-7\",\"cwd\":\"$(pwd)\",\"tools\":[]}}"
+if [ ! -f '{count}' ]; then
+  : > '{count}'
+  printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"cd repositories/loom && cat Cargo.toml"}}}}]}}}}'
+  printf '%s\n' '{{"type":"control_request","request_id":"r1","request":{{"subtype":"can_use_tool","tool_name":"Bash","input":{{"command":"cargo test -p loom-harness"}}}}}}'
+  while read line; do
+    echo "answer $line" >> '{log}'
+    case "$line" in
+      *'"behavior":"allow"'*)
+        printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-7"}}'
+        exit 0;;
+    esac
+  done
+fi
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"resumed","session_id":"s-7"}}'
+"#,
+        log = log.display(),
+        count = count.display()
+    );
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), &script);
+    provider.bind_workspace(&dir);
+    let mut sink = loom_model::CollectingSink::default();
+    provider
+        .stream(
+            &request(vec![message(MessageRole::User, "check the harness")]),
+            &CancellationToken::default(),
+            &mut sink,
+        )
+        .unwrap();
+    let call = sink
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ModelStreamEvent::ToolCallDelta { call } => Some(call.clone()),
+            _ => None,
+        })
+        .expect("the turn asks for approval");
+    assert_eq!(
+        call.arguments["input"],
+        json!({"command": "cargo test -p loom-harness"})
+    );
+    // The shell moved to repositories/loom before it asked, so that is the
+    // directory the call was asked in.
+    let shell_cwd = format!("{}/repositories/loom", dir.display());
+    assert_eq!(call.arguments["shell_cwd"], json!(shell_cwd));
+
+    // The run that finishes the call has no kept process and starts a new CLI:
+    // it starts where the call was asked to run, and says so, because a fresh
+    // CLI does not inherit the directory.
+    let mut asked = message(MessageRole::Assistant, "");
+    asked.tool_calls = vec![call.clone()];
+    let mut answer = message(MessageRole::Tool, CLAUDE_CODE_PERMISSION_APPROVED);
+    answer.name = Some(CLAUDE_CODE_PERMISSION_TOOL.to_owned());
+    answer.tool_call_id = Some(call.id);
+    let history = vec![
+        message(MessageRole::User, "check the harness"),
+        asked,
+        answer,
+    ];
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), &script);
+    provider.bind_workspace(&dir);
+    // A different pool key, as another worker instance has: no kept process.
+    provider.bind_build_cache(Some(&dir.join("build-cache")));
+    let mut sink = loom_model::CollectingSink::default();
+    provider
+        .stream(&request(history), &CancellationToken::default(), &mut sink)
+        .unwrap();
+
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(seen.contains(&format!("started in {shell_cwd}")), "{seen}");
+    assert!(seen.contains("--resume s-7"), "{seen}");
+    assert!(
+        seen.contains(&format!("The working directory is {shell_cwd}.")),
+        "{seen}"
+    );
+    assert!(
+        seen.contains("this input: {\"command\":\"cargo test -p loom-harness\"}"),
+        "{seen}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
