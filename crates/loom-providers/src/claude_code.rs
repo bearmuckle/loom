@@ -20,13 +20,19 @@
 //! kept process, and the next run answers it there with the exact input that
 //! was asked about, so nothing is replayed. When the process is gone, as after
 //! a worker restart, the next turn resumes the CLI's conversation, tells it to
-//! retry, and allows exactly that tool input: a decision lives in the
-//! transcript. Edits inside the working directory and read-only commands never
-//! ask.
+//! retry with that same input, and allows exactly that tool input: a decision
+//! lives in the transcript. The directory the shell had moved to is recorded
+//! with the decision, so the CLI started again runs the call in the directory
+//! it was asked in instead of the session's workspace root. Edits inside the
+//! working directory and read-only commands never ask.
 
 mod live;
 
-use std::{path::Path, process::Command, time::Duration};
+use std::{
+    path::{Component, Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use loom_model::{
     CLAUDE_CODE_PERMISSION_APPROVED, CLAUDE_CODE_PERMISSION_TOOL, UsageLimitWindow, UsageLimits,
@@ -48,6 +54,8 @@ const POLL: Duration = Duration::from_millis(200);
 const SUMMARY_BYTES: usize = 160;
 /// The permission call argument that keeps the CLI's session id.
 const CLAUDE_SESSION_ARGUMENT: &str = "claude_session";
+/// The permission call argument that keeps the directory the shell was in.
+const SHELL_CWD_ARGUMENT: &str = "shell_cwd";
 
 pub struct ClaudeCodeProvider {
     descriptor: ModelDescriptor,
@@ -57,6 +65,10 @@ pub struct ClaudeCodeProvider {
     build_cache: Option<PathBuf>,
     /// The CLI's own id for the conversation, so later turns continue it.
     claude_session: Option<String>,
+    /// The directory the CLI's shell is in, as far as the CLI has reported.
+    /// A parked approval records it, so the run that finishes the call starts
+    /// the CLI where the call was asked to run.
+    shell_cwd: Option<PathBuf>,
     /// How many messages of the request the CLI has already seen, counting the
     /// reply it gave.
     delivered: usize,
@@ -70,6 +82,7 @@ impl ClaudeCodeProvider {
             cwd: None,
             build_cache: None,
             claude_session: None,
+            shell_cwd: None,
             delivered: 0,
         }
     }
@@ -167,7 +180,9 @@ impl ClaudeCodeProvider {
     /// A fresh provider knows nothing of the CLI's session. When the last reply
     /// in the transcript is a permission call that recorded one, the CLI is
     /// still at that point, so the run continues it and sends only what came
-    /// after: the decision and any message typed meanwhile.
+    /// after: the decision and any message typed meanwhile. The directory the
+    /// shell was in is picked up the same way, so the call runs where it was
+    /// asked.
     fn restore_parked_session(&mut self, messages: &[ModelMessage]) {
         let Some(index) = messages
             .iter()
@@ -175,14 +190,27 @@ impl ClaudeCodeProvider {
         else {
             return;
         };
-        let id = messages[index]
+        let Some(call) = messages[index]
             .tool_calls
             .iter()
-            .filter(|call| call.name == CLAUDE_CODE_PERMISSION_TOOL)
-            .find_map(|call| call.arguments.get(CLAUDE_SESSION_ARGUMENT)?.as_str());
-        if let Some(id) = id {
+            .find(|call| call.name == CLAUDE_CODE_PERMISSION_TOOL)
+        else {
+            return;
+        };
+        if let Some(id) = call
+            .arguments
+            .get(CLAUDE_SESSION_ARGUMENT)
+            .and_then(serde_json::Value::as_str)
+        {
             self.claude_session = Some(id.to_owned());
             self.delivered = index + 1;
+        }
+        if let Some(dir) = call
+            .arguments
+            .get(SHELL_CWD_ARGUMENT)
+            .and_then(serde_json::Value::as_str)
+        {
+            self.shell_cwd = Some(PathBuf::from(dir));
         }
     }
 
@@ -205,6 +233,13 @@ impl ClaudeCodeProvider {
         if let Some(id) = &self.claude_session {
             arguments[CLAUDE_SESSION_ARGUMENT] = serde_json::Value::String(id.clone());
         }
+        // The shell's directory is kept too: a run that has to start a new CLI
+        // puts the approved call back in the directory it was asked in, and the
+        // note names that directory, which a fresh CLI does not inherit.
+        if let Some(dir) = &self.shell_cwd {
+            arguments[SHELL_CWD_ARGUMENT] =
+                serde_json::Value::String(dir.to_string_lossy().into_owned());
+        }
         emit(
             sink,
             ModelStreamEvent::ToolCallDelta {
@@ -223,6 +258,36 @@ impl ClaudeCodeProvider {
         )?;
         self.delivered = request.messages.len() + 1;
         Ok(())
+    }
+
+    /// Where a fresh CLI process starts.
+    ///
+    /// The directory the shell was in when the last parked call asked comes
+    /// first, so an approved command runs where it was asked and not in the
+    /// workspace root; a directory that is gone falls back to the workspace.
+    fn spawn_cwd(&self, workspace: &Path) -> PathBuf {
+        self.shell_cwd
+            .as_deref()
+            .filter(|dir| dir.is_dir())
+            .map_or_else(|| workspace.to_path_buf(), Path::to_path_buf)
+    }
+
+    /// Follows the CLI's persistent shell when a command moves it.
+    ///
+    /// Only the directory of a command that begins with a plain `cd` is taken:
+    /// a `cd` the shell has to expand, such as one with a variable or a quote,
+    /// says nothing for certain, and a wrong directory is worse than none.
+    fn track_shell_cwd(&mut self, input: &serde_json::Value) {
+        let Some(command) = input.get("command").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(target) = led_directory(command) else {
+            return;
+        };
+        let Some(base) = self.shell_cwd.clone().or_else(|| self.cwd.clone()) else {
+            return;
+        };
+        self.shell_cwd = Some(resolve(&base, target));
     }
 
     /// Where this session's kept process waits: the session's own build cache
@@ -255,6 +320,7 @@ impl ClaudeCodeProvider {
     ) {
         let messages = &request.messages;
         live.claude_session = self.claude_session.clone();
+        live.shell_cwd = self.shell_cwd.clone();
         live.anchor = live::Anchor::of(messages, self.delivered);
         live.pending = pending;
         live::put(key, live);
@@ -351,14 +417,18 @@ struct Decided {
     tool: String,
     input: serde_json::Value,
     approved: bool,
+    /// The directory the CLI's shell was in when the call parked, when the
+    /// parked call recorded one.
+    shell_cwd: Option<PathBuf>,
 }
 
 impl Decided {
     /// What the CLI is told about the decision.
     ///
-    /// The note is Loom's, not the person's words, so it says so. The CLI
-    /// starts again in `cwd` for every turn, so the note names it: a directory
-    /// an earlier command changed to is not kept.
+    /// The note is Loom's, not the person's words, so it says so. It names the
+    /// directory the call was asked in, taken from where the shell was when it
+    /// parked; a CLI started again does not inherit a directory an earlier
+    /// command changed to.
     fn note(&self, cwd: Option<&Path>) -> String {
         let note = if self.approved {
             format!(
@@ -373,8 +443,12 @@ impl Decided {
                 self.tool
             )
         };
-        match cwd {
-            Some(dir) => format!("{note}\nThe working directory is {}.", dir.display()),
+        match self.shell_cwd.as_deref().or(cwd) {
+            Some(dir) => format!(
+                "{note}\nThe working directory is {}. The input runs there exactly as it was \
+                 approved, with no directory from an earlier command.",
+                dir.display()
+            ),
             None => note,
         }
     }
@@ -449,7 +523,55 @@ fn decided_at(messages: &[ModelMessage], index: usize) -> Option<Decided> {
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         approved: answer.content.trim() == CLAUDE_CODE_PERMISSION_APPROVED,
+        shell_cwd: call
+            .arguments
+            .get(SHELL_CWD_ARGUMENT)
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from),
     })
+}
+
+/// The directory a command's leading `cd` moves the shell to.
+///
+/// A plain path only: a target the shell has to expand, such as one with a
+/// variable, a quote or a glob, is not followed because the directory it
+/// names is not known for certain.
+fn led_directory(command: &str) -> Option<&str> {
+    let rest = command.trim_start().strip_prefix("cd")?;
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let target = rest.split(['&', ';', '|', '\n']).next()?.trim();
+    let plain = !target.is_empty()
+        && !target.starts_with('-')
+        && !target.chars().any(|c| {
+            matches!(
+                c,
+                '\'' | '"' | '$' | '`' | '~' | '*' | '?' | '(' | ')' | '\\'
+            )
+        });
+    plain.then_some(target)
+}
+
+/// `base` joined with `target`, with `.` and `..` folded away.
+fn resolve(base: &Path, target: &str) -> PathBuf {
+    let path = Path::new(target);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let mut folded = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                folded.pop();
+            }
+            other => folded.push(other),
+        }
+    }
+    folded
 }
 
 /// Every tool input the person approved so far in this transcript.
@@ -692,6 +814,7 @@ impl ModelProvider for ClaudeCodeProvider {
         let (mut live, opening, mut queued) = match kept {
             Some((mut live, delivered)) => {
                 self.claude_session = live.claude_session.clone();
+                self.shell_cwd = live.shell_cwd.clone();
                 self.delivered = delivered;
                 let mut queued = std::mem::take(&mut live.queued);
                 match live.pending.take() {
@@ -725,7 +848,8 @@ impl ModelProvider for ClaudeCodeProvider {
                         "there is no new user message to send to Claude Code",
                     ));
                 }
-                let session = ClaudeCodeSession::spawn(&self.options(cwd, system))?;
+                let session =
+                    ClaudeCodeSession::spawn(&self.options(self.spawn_cwd(&cwd), system))?;
                 (
                     live::Live::new(session, launch),
                     Opening::Prompt(prompt),
@@ -841,8 +965,15 @@ impl ModelProvider for ClaudeCodeProvider {
             }
             let reasoning = |text: String| ModelStreamEvent::ReasoningDelta { text };
             let flow = match event {
-                ClaudeEvent::Init { session_id, .. } => {
+                ClaudeEvent::Init {
+                    session_id,
+                    cwd: shell_cwd,
+                    ..
+                } => {
                     self.claude_session = Some(session_id);
+                    if let Some(dir) = shell_cwd {
+                        self.shell_cwd = Some(dir);
+                    }
                     StreamFlow::Continue
                 }
                 ClaudeEvent::TextDelta {
@@ -864,6 +995,9 @@ impl ModelProvider for ClaudeCodeProvider {
                 } => {
                     if parent_tool_use_id.is_none() {
                         reply.tool_call();
+                        if name == "Bash" {
+                            self.track_shell_cwd(&input);
+                        }
                     }
                     emit(sink, reasoning(tool_summary(&name, &input)))?
                 }

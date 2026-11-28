@@ -72,6 +72,7 @@ fn lines_decode_into_events() {
             model: Some("claude-sonnet-5-5".into()),
             tools: vec!["Bash".into()],
             permission_mode: Some("default".into()),
+            cwd: Some(PathBuf::from("/work")),
         }
     );
     assert_eq!(

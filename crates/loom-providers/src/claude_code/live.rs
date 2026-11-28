@@ -38,6 +38,9 @@ pub(super) struct Live {
     /// What the process was started with; a change needs a new process.
     pub launch: String,
     pub claude_session: Option<String>,
+    /// The directory the CLI's shell is in, as far as the CLI has reported; a
+    /// kept process carries it to the next turn's provider.
+    pub shell_cwd: Option<PathBuf>,
     /// Where the process stands in the transcript, so a transcript it does not
     /// belong to never takes it.
     pub anchor: Anchor,
@@ -54,6 +57,7 @@ impl Live {
             session,
             launch,
             claude_session: None,
+            shell_cwd: None,
             anchor: Anchor::default(),
             pending: None,
             queued: Vec::new(),
